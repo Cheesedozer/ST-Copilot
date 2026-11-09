@@ -14414,6 +14414,48 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       }
   }
 
+  // Chat-completion sources whose model setting is not stored under `${source}_model`.
+  const CC_MODEL_KEYS = { makersuite: 'google_model' };
+
+  // Reads the API the user has selected in SillyTavern right now. The live settings are the
+  // source of truth for "Use Currently Selected API": a Connection Manager profile or a saved
+  // preset only holds the model it had when it was last saved, so switching e.g. from Claude
+  // to Gemini without re-saving it would otherwise keep sending requests to the old model.
+  function _getLiveConnection(ctx) {
+      const mainApi = ctx.mainApi || ctx.main_api || window.main_api
+          || (typeof document !== 'undefined' ? document.getElementById('main_api')?.value : null) || null;
+      if (mainApi === 'openai') {
+          const oai = ctx.chatCompletionSettings || window.oai_settings || {};
+          const source = oai.chat_completion_source || null;
+          let model = null;
+          if (typeof ctx.getChatCompletionModel === 'function') {
+              try { model = ctx.getChatCompletionModel(oai) || null; } catch (_) {}
+          }
+          if (!model && source) model = oai[CC_MODEL_KEYS[source] || `${source}_model`] || null;
+          return { mainApi, source, model, settings: oai };
+      }
+      if (mainApi === 'textgenerationwebui') {
+          const tg = ctx.textCompletionSettings || window.textgenerationwebui_settings || {};
+          return { mainApi, source: tg.type || null, model: null, settings: tg };
+      }
+      return { mainApi, source: null, model: null, settings: null };
+  }
+
+  // Fields that pin a chat-completion request to the live connection rather than whatever
+  // a preset last saved.
+  function _liveChatCompletionFields(live) {
+      if (live?.mainApi !== 'openai' || !live.source) return {};
+      const o = live.settings || {};
+      const fields = { chat_completion_source: live.source };
+      if (live.model) fields.model = live.model;
+      if (live.source === 'custom' && o.custom_url) fields.custom_url = o.custom_url;
+      if (o.reverse_proxy) {
+          fields.reverse_proxy = o.reverse_proxy;
+          if (o.proxy_password) fields.proxy_password = o.proxy_password;
+      }
+      return fields;
+  }
+
   async function callGenerate(session, settings, pendingText, onChunk) {
       const ctx = SillyTavern.getContext();
       const messages = await assembleMessages(session, settings, pendingText);
@@ -14618,7 +14660,18 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           } else {
               throw new Error('No profile selected in ST-Copilot settings.');
           }
-      } else if (settings.connectionSource !== 'custom') {
+      }
+
+      // "Use Currently Selected API": send through ST's live API settings so the request uses
+      // the model selected right now. The selected Connection Manager profile is only a
+      // fallback for APIs the live services below can't drive, since it carries the model
+      // saved in the profile, which goes stale as soon as the user switches models.
+      const live = _getLiveConnection(ctx);
+      const liveCC = settings.connectionSource === 'profile' ? {} : _liveChatCompletionFields(live);
+      const canUseLive = (live.mainApi === 'openai' && !!ctx.ChatCompletionService)
+          || (live.mainApi === 'textgenerationwebui' && !!ctx.TextCompletionService);
+
+      if (settings.connectionSource !== 'profile' && !canUseLive) {
           const domSelect = document.getElementById('connection_profiles');
           if (domSelect && domSelect.value) {
               profileId = domSelect.value;
@@ -14630,6 +14683,25 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               useConnectionManager = true;
           }
       }
+
+      const sendLive = (stream) => {
+          if (live.mainApi === 'openai' && ctx.ChatCompletionService) {
+              return ctx.ChatCompletionService.processRequest({
+                  messages: messages,
+                  max_tokens: maxTokens,
+                  stream,
+                  ...liveCC
+              }, { presetName: live.settings?.preset_settings_openai }, false, abort.signal);
+          }
+          if (live.mainApi === 'textgenerationwebui' && ctx.TextCompletionService) {
+              return ctx.TextCompletionService.processRequest({
+                  prompt: messages,
+                  max_tokens: maxTokens,
+                  stream
+              }, { presetName: live.settings?.preset_settings_textgenerationwebui }, false, abort.signal);
+          }
+          throw new Error('No active API connection found. Please select a profile in Connection Manager or configure the main API.');
+      };
 
       let asyncGeneratorFn;
       const origFetch = window.fetch;
@@ -14649,6 +14721,13 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                       if (reqBody.reasoning.effort === 'auto') { delete reqBody.reasoning.effort; changed = true; }
                       else if (reqBody.reasoning.effort === 'min') { reqBody.reasoning.effort = 'low'; changed = true; }
                       else if (reqBody.reasoning.effort === 'max') { reqBody.reasoning.effort = 'high'; changed = true; }
+                  }
+
+                  // Applying the saved preset can put the preset's own source/model back in.
+                  if (requestUrl.includes('/chat-completions/generate') && liveCC.chat_completion_source) {
+                      for (const [k, v] of Object.entries(liveCC)) {
+                          if (reqBody[k] !== v) { reqBody[k] = v; changed = true; }
+                      }
                   }
 
                   if (reqBody.custom_prompt_post_processing === '') { delete reqBody.custom_prompt_post_processing; changed = true; }
@@ -14678,24 +14757,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                   includePreset: true
               });
           } else {
-              const mainApi = window.main_api || ctx.main_api;
-              if (mainApi === 'openai' && ctx.ChatCompletionService) {
-                  const oaiSettings = window.oai_settings || ctx.oai_settings || {};
-                  asyncGeneratorFn = await ctx.ChatCompletionService.processRequest({
-                      messages: messages,
-                      max_tokens: maxTokens,
-                      stream: useStream
-                  }, { presetName: oaiSettings.preset_settings_openai }, false, abort.signal);
-              } else if (mainApi === 'textgenerationwebui' && ctx.TextCompletionService) {
-                  const textGenSettings = window.textgenerationwebui_settings || ctx.textgenerationwebui_settings || {};
-                  asyncGeneratorFn = await ctx.TextCompletionService.processRequest({
-                      prompt: messages,
-                      max_tokens: maxTokens,
-                      stream: useStream
-                  }, { presetName: textGenSettings.preset_settings_textgenerationwebui }, false, abort.signal);
-              } else {
-                  throw new Error('No active API connection found. Please select a profile in Connection Manager or configure the main API.');
-              }
+              asyncGeneratorFn = await sendLive(useStream);
           }
       } catch (e) {
           if (useStream && !abort.signal.aborted && e?.name !== 'AbortError' && e?.message !== 'userStopped') {
@@ -14711,22 +14773,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                           includePreset: true
                       });
                   } else {
-                      const mainApi = window.main_api || ctx.main_api;
-                      if (mainApi === 'openai' && ctx.ChatCompletionService) {
-                          const oaiSettings = window.oai_settings || ctx.oai_settings || {};
-                          asyncGeneratorFn = await ctx.ChatCompletionService.processRequest({
-                              messages: messages,
-                              max_tokens: maxTokens,
-                              stream: false
-                          }, { presetName: oaiSettings.preset_settings_openai }, false, abort.signal);
-                      } else if (mainApi === 'textgenerationwebui' && ctx.TextCompletionService) {
-                          const textGenSettings = window.textgenerationwebui_settings || ctx.textgenerationwebui_settings || {};
-                          asyncGeneratorFn = await ctx.TextCompletionService.processRequest({
-                              prompt: messages,
-                              max_tokens: maxTokens,
-                              stream: false
-                          }, { presetName: textGenSettings.preset_settings_textgenerationwebui }, false, abort.signal);
-                      }
+                      asyncGeneratorFn = await sendLive(false);
                   }
               } catch (err2) {
                   state.abortController = null;
@@ -15300,7 +15347,9 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
   var api = /*#__PURE__*/Object.freeze({
     __proto__: null,
     _buildAiContextForHistoryMsg: _buildAiContextForHistoryMsg,
+    _getLiveConnection: _getLiveConnection,
     _joinContinuation: _joinContinuation,
+    _liveChatCompletionFields: _liveChatCompletionFields,
     assembleMessages: assembleMessages,
     buildSystemContent: buildSystemContent,
     callGenerate: callGenerate,
