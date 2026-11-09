@@ -5622,6 +5622,24 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       es.emit(et.CHARACTER_EDITED, { detail: { id: id >= 0 ? id : ctx.characterId, character: char } });
   }
 
+  // Renaming a character makes SillyTavern rename its card file too (Old.png -> New.png).
+  // Point the caller's character object at the new file so later edits don't target the
+  // old, now missing, file (which the server answers with HTTP 500).
+  function _adoptRenamedCard(char, newAvatar, newName) {
+      if (!newAvatar) {
+          const list = SillyTavern.getContext().characters || [];
+          const oldAvatar = char.avatar;
+          const stem = s => String(s || '').replace(/\.png$/i, '').replace(/\d+$/, '').toLowerCase();
+          const candidates = list.filter(c => c && c.name === newName && c.avatar !== oldAvatar);
+          const match = candidates.length === 1 ? candidates[0]
+              : candidates.find(c => stem(c.avatar) === newName.toLowerCase());
+          if (match) newAvatar = match.avatar;
+      }
+      if (newAvatar) char.avatar = newAvatar;
+      char.name = newName;
+      if (char.data) char.data.name = newName;
+  }
+
   async function saveCharacterField(char, fieldId, newValue) {
       const ctx = SillyTavern.getContext();
       
@@ -5713,6 +5731,9 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           if (isSelected && typeof ctx.executeSlashCommandsWithOptions === 'function') {
               const safeName = trimmedName.replace(/"/g, '\\"');
               await ctx.executeSlashCommandsWithOptions(`/rename-char silent=true chats=true "${safeName}"`);
+              const fresh = SillyTavern.getContext();
+              const renamed = fresh.characters?.[fresh.characterId];
+              _adoptRenamedCard(char, renamed?.name === trimmedName ? renamed.avatar : null, trimmedName);
               return;
           }
 
@@ -5725,10 +5746,10 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
               const errText = await renameRes.text().catch(() => renameRes.statusText);
               throw new Error(`Rename failed: HTTP ${renameRes.status}: ${errText}`);
           }
-          char.name = trimmedName;
-          if (char.data) char.data.name = trimmedName;
+          const renameBody = await renameRes.json().catch(() => null);
           if (typeof ctx.getCharacters === 'function') await ctx.getCharacters().catch(() => {});
           else if (typeof window.getCharacters === 'function') await window.getCharacters().catch(() => {});
+          _adoptRenamedCard(char, renameBody?.avatar || null, trimmedName);
           _emitCharacterEdited(ctx, char);
           if (typeof window.PrintCharacterList === 'function') window.PrintCharacterList();
           return;
@@ -6117,11 +6138,16 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       buildAltGreetingsPicker(document.getElementById('scp-sp-ov-ce-alt-greetings-picker'), true);
   }
 
+  // Returns the changes that failed, so callers can keep them pending.
   async function applyCharChanges(changes, char, afterMsgId = null) {
-      if (!char) { toastr.error('[CharEdit] No active character.', EXT_DISPLAY); return; }
+      if (!char) { toastr.error('[CharEdit] No active character.', EXT_DISPLAY); return [...changes]; }
       const successLog = [];
+      const failed = [];
 
-      for (const change of changes) {
+      // Rename last: it renames the card file, and the other edits are addressed by file name.
+      const ordered = [...changes.filter(c => c.field !== 'name'), ...changes.filter(c => c.field === 'name')];
+
+      for (const change of ordered) {
           const { field, action } = change;
           if (!field) continue;
           try {
@@ -6133,7 +6159,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
                       successLog.push(change);
                   } else {
                       const idx = (change.index || 1) - 1;
-                      if (idx < 0 || idx >= greetings.length) { toastr.warning(`[CharEdit] Greeting index ${change.index} out of range.`, EXT_DISPLAY); continue; }
+                      if (idx < 0 || idx >= greetings.length) { toastr.warning(`[CharEdit] Greeting index ${change.index} out of range.`, EXT_DISPLAY); failed.push(change); continue; }
 
                       if (action === 'overwrite') {
                           greetings[idx] = change.value || '';
@@ -6149,7 +6175,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
                               if (!matched) { toastr.warning(`[CharEdit] SEARCH not found in greeting #${change.index}.`, EXT_DISPLAY); allMatched = false; break; }
                               current = result;
                           }
-                          if (!allMatched) continue;
+                          if (!allMatched) { failed.push(change); continue; }
                           greetings[idx] = current;
                       }
 
@@ -6175,13 +6201,14 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
                       if (!matched) { toastr.warning(`[CharEdit] SEARCH not found in field "${field}": "${(patch.search || '').slice(0, 60)}…"`, EXT_DISPLAY, { timeOut: 8000 }); allMatched = false; break; }
                       current = result;
                   }
-                  if (!allMatched) continue;
+                  if (!allMatched) { failed.push(change); continue; }
                   await saveCharacterField(char, field, current);
                   successLog.push(change);
               }
           } catch (e) {
               console.error(`[ST-Copilot-Debug] Failed on char field "${field}":`, e);
               toastr.error(`[CharEdit] Failed on "${field}": ${e.message}`, EXT_DISPLAY, { timeOut: 10000 });
+              failed.push(change);
           }
       }
 
@@ -6189,6 +6216,10 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           logCharEditHistory(successLog, 'Applied', afterMsgId, char.name);
           toastr.success(`[CharEdit] ${successLog.length} change(s) applied to ${char.name}.`, EXT_DISPLAY);
       }
+      if (failed.length > 0) {
+          toastr.warning(`[CharEdit] ${failed.length} change(s) failed and were kept as pending.`, EXT_DISPLAY, { timeOut: 8000 });
+      }
+      return failed;
   }
 
   function logCharEditHistory(changes, statusStr, afterMsgId = null, charName = null) {
@@ -6397,21 +6428,37 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       bringWindowToFront();
   }
 
-  function _syncAllCardsToMessage(msgId) {
+  // `extraCard` is included even when it is no longer in the DOM (a rename can re-render the chat).
+  function _syncAllCardsToMessage(msgId, extraCard = null) {
       const session = getCurrentSession();
       const msg = session.messages.find(m => m.id === msgId);
-      if (!msg) return;
-      const cards = document.querySelectorAll(`.scp-char-proposal-card[data-for="${msgId}"]`);
+      if (!msg) return null;
+      const cards = [...document.querySelectorAll(`.scp-char-proposal-card[data-for="${msgId}"]`)];
+      if (extraCard && !cards.includes(extraCard)) cards.push(extraCard);
       const pendingAll = [];
       cards.forEach(c => {
           const ec = c._editableChanges || [];
           const states = c._itemStates || [];
-          ec.forEach((change, i) => { if (states[i] === 'pending') pendingAll.push(change); });
+          ec.forEach((change, i) => {
+              if (states[i] !== 'pending') return;
+              if (c._char?.name) change.char = c._char.name;
+              pendingAll.push(change);
+          });
       });
       const stripped = stripCharChangesBlock(msg.content);
       msg.content = pendingAll.length ? stripped + '\n\n' + reconstructCharChangesBlock(pendingAll) : stripped;
       if (msg.swipes) msg.swipes[msg.swipeIndex || 0].content = msg.content;
       saveSessionsToMetadata();
+      return msg;
+  }
+
+  // After a batch that included a rename: the card may have been re-rendered or removed,
+  // so write the failed edits back as pending and redraw the message from storage.
+  function _restoreFailedAfterRename(msgId, card) {
+      const msg = _syncAllCardsToMessage(msgId, card);
+      if (!msg) return;
+      const msgEl = document.querySelector(`.scp-msg[data-id="${msgId}"]`) || card.closest?.('[data-id]');
+      if (msgEl) _renderMsgBodyContent(msgEl, msg);
   }
 
   function _buildCharProposalCardForCharacter(changes, msgEl, char) {
@@ -6434,6 +6481,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       card.style.margin = '8px 0 0 0';
       card._editableChanges = editableChanges;
       card._itemStates = itemStates;
+      card._char = char;
 
       const getPending = () => itemStates.filter(s => s === 'pending').length;
       const checkAllResolved = () => {
@@ -6574,7 +6622,13 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
               if (isNameField) { itemStates[ci] = 'applied'; _syncAllCardsToMessage(msgId); }
 
               try {
-                  await applyCharChanges([editableChanges[ci]], char, msgId);
+                  const failed = await applyCharChanges([editableChanges[ci]], char, msgId);
+                  if (failed.length) {
+                      itemStates[ci] = 'pending';
+                      if (isNameField) _restoreFailedAfterRename(msgId, card);
+                      applyBtn.disabled = false; applyBtn.textContent = '\u2713';
+                      return;
+                  }
                   if (!isNameField) { itemStates[ci] = 'applied'; _syncAllCardsToMessage(msgId); }
 
                   item.classList.add('scp-lb-item-applied');
@@ -6742,11 +6796,15 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           if (hasNameField) { pendingIndices.forEach(i => { itemStates[i] = 'applied'; }); _syncAllCardsToMessage(msgId); }
 
           try {
-              await applyCharChanges(pending, char, msgId);
-              if (!hasNameField) { pendingIndices.forEach(i => { itemStates[i] = 'applied'; }); _syncAllCardsToMessage(msgId); }
-              pendingIndices.forEach(i => {
+              const failed = new Set(await applyCharChanges(pending, char, msgId));
+              const okIndices = pendingIndices.filter(i => !failed.has(editableChanges[i]));
+              pendingIndices.forEach(i => { itemStates[i] = failed.has(editableChanges[i]) ? 'pending' : 'applied'; });
+              if (hasNameField && failed.size) _restoreFailedAfterRename(msgId, card);
+              else _syncAllCardsToMessage(msgId);
+              okIndices.forEach(i => {
                   if (itemEls[i]) { itemEls[i].classList.add('scp-lb-item-applied'); itemEls[i].querySelectorAll('button').forEach(b => { b.disabled = true; }); }
               });
+              applyAllBtn.disabled = false; applyAllBtn.textContent = 'Apply All';
               countBadge.textContent = `${getPending()} pending`; updateFooter();
               checkAllResolved();
           } catch (e) {
