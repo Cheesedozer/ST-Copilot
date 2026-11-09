@@ -504,6 +504,24 @@ function _emitCharacterEdited(ctx, char) {
     es.emit(et.CHARACTER_EDITED, { detail: { id: id >= 0 ? id : ctx.characterId, character: char } });
 }
 
+// Renaming a character makes SillyTavern rename its card file too (Old.png -> New.png).
+// Point the caller's character object at the new file so later edits don't target the
+// old, now missing, file (which the server answers with HTTP 500).
+export function _adoptRenamedCard(char, newAvatar, newName) {
+    if (!newAvatar) {
+        const list = SillyTavern.getContext().characters || [];
+        const oldAvatar = char.avatar;
+        const stem = s => String(s || '').replace(/\.png$/i, '').replace(/\d+$/, '').toLowerCase();
+        const candidates = list.filter(c => c && c.name === newName && c.avatar !== oldAvatar);
+        const match = candidates.length === 1 ? candidates[0]
+            : candidates.find(c => stem(c.avatar) === newName.toLowerCase());
+        if (match) newAvatar = match.avatar;
+    }
+    if (newAvatar) char.avatar = newAvatar;
+    char.name = newName;
+    if (char.data) char.data.name = newName;
+}
+
 export async function saveCharacterField(char, fieldId, newValue) {
     const ctx = SillyTavern.getContext();
     
@@ -595,6 +613,9 @@ export async function saveCharacterField(char, fieldId, newValue) {
         if (isSelected && typeof ctx.executeSlashCommandsWithOptions === 'function') {
             const safeName = trimmedName.replace(/"/g, '\\"');
             await ctx.executeSlashCommandsWithOptions(`/rename-char silent=true chats=true "${safeName}"`);
+            const fresh = SillyTavern.getContext();
+            const renamed = fresh.characters?.[fresh.characterId];
+            _adoptRenamedCard(char, renamed?.name === trimmedName ? renamed.avatar : null, trimmedName);
             return;
         }
 
@@ -607,10 +628,10 @@ export async function saveCharacterField(char, fieldId, newValue) {
             const errText = await renameRes.text().catch(() => renameRes.statusText);
             throw new Error(`Rename failed: HTTP ${renameRes.status}: ${errText}`);
         }
-        char.name = trimmedName;
-        if (char.data) char.data.name = trimmedName;
+        const renameBody = await renameRes.json().catch(() => null);
         if (typeof ctx.getCharacters === 'function') await ctx.getCharacters().catch(() => {});
         else if (typeof window.getCharacters === 'function') await window.getCharacters().catch(() => {});
+        _adoptRenamedCard(char, renameBody?.avatar || null, trimmedName);
         _emitCharacterEdited(ctx, char);
         if (typeof window.PrintCharacterList === 'function') window.PrintCharacterList();
         return;
