@@ -1472,6 +1472,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           includeCharacterCard: true,
           includeUserPersonality: true,
           includeAlternateSwipes: false,
+          includeActivePreset: false,
           systemPrompt: '',
           memoryManagePrompt: '',
           profiles: {},
@@ -3088,6 +3089,70 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
   function getAuthorsNote() {
       const ctx = SillyTavern.getContext();
       return ctx.chatMetadata?.note_prompt || ctx.authorsNote || ctx.authors_note || '';
+  }
+
+  /**
+   * Snapshot of the user's active generation preset, for the AI context.
+   * Chat Completion: preset name + enabled Prompt Manager prompts (markers skipped).
+   * Text Completion: preset name + instruct/context template names + system prompt.
+   * Returns null when nothing useful could be read.
+   */
+  function getActivePresetInfo() {
+      const ctx = SillyTavern.getContext();
+      const api = ctx.mainApi || '';
+      const presetName = (apiId) => {
+          try { return ctx.getPresetManager?.(apiId)?.getSelectedPresetName?.() || ''; } catch (_) { return ''; }
+      };
+      const expand = (text) => {
+          if (typeof text !== 'string' || !text) return '';
+          try { return typeof ctx.substituteParams === 'function' ? ctx.substituteParams(text) : text; } catch (_) { return text; }
+      };
+
+      if (api === 'openai') {
+          const prompts = [];
+          try {
+              const pm = ctx.promptManager;
+              const list = pm?.getPromptsForCharacter?.(pm.activeCharacter, true) || [];
+              for (const p of list) {
+                  if (!p || p.marker) continue;
+                  const content = expand(p.content || '').trim();
+                  if (!content) continue;
+                  prompts.push({ name: p.name || p.identifier || 'Prompt', role: p.role || 'system', content });
+              }
+          } catch (_) {}
+          const name = presetName('openai') || ctx.chatCompletionSettings?.preset_settings_openai || '';
+          if (!name && !prompts.length) return null;
+          return { api, name, prompts };
+      }
+
+      const pu = ctx.powerUserSettings || {};
+      const name = presetName(api);
+      const info = { api, name, prompts: [] };
+      if (pu.instruct?.enabled && pu.instruct.preset) info.instructTemplate = pu.instruct.preset;
+      if (pu.context?.preset) info.contextTemplate = pu.context.preset;
+      if (pu.sysprompt?.enabled !== false && pu.sysprompt?.content) {
+          const content = expand(pu.sysprompt.content).trim();
+          if (content) info.prompts.push({ name: pu.sysprompt.name || 'System Prompt', role: 'system', content });
+      }
+      if (!name && !info.instructTemplate && !info.contextTemplate && !info.prompts.length) return null;
+      return info;
+  }
+
+  function buildActivePresetBlock() {
+      const info = getActivePresetInfo();
+      if (!info) return '';
+      const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+      const lines = [
+          'This is the generation preset the user is currently roleplaying with. Its prompts are sent alongside the character card, so keep card edits consistent with it and avoid duplicating or contradicting its instructions.',
+          `API: ${info.api || 'unknown'}`,
+      ];
+      if (info.name) lines.push(`Preset: ${info.name}`);
+      if (info.instructTemplate) lines.push(`Instruct template: ${info.instructTemplate}`);
+      if (info.contextTemplate) lines.push(`Context template: ${info.contextTemplate}`);
+      for (const p of info.prompts) {
+          lines.push(`\n<preset_prompt name="${esc(p.name)}" role="${esc(p.role)}">\n${p.content}\n</preset_prompt>`);
+      }
+      return `\n\n<active_preset>\n${lines.join('\n')}\n</active_preset>`;
   }
 
   let _regexModule = false;
@@ -9002,6 +9067,7 @@ ${scopeHtml}
       { key: 'includeSystemPrompt', stId: 'scp-include-sysprompt', spId: 'scp-sp-include-sysprompt', type: 'checkbox', updCtx: true, profileKey: true },
       { key: 'includeUserPersonality', stId: 'scp-include-persona', spId: 'scp-sp-include-persona', type: 'checkbox', updCtx: true, profileKey: true },
       { key: 'includeAlternateSwipes', stId: 'scp-include-alt-swipes', spId: 'scp-sp-include-alt-swipes', type: 'checkbox', updCtx: true, profileKey: true },
+      { key: 'includeActivePreset', stId: 'scp-include-active-preset', spId: 'scp-sp-include-active-preset', type: 'checkbox', updCtx: true, profileKey: true },
       { key: 'applyRegexToContext', stId: 'scp-apply-regex', spId: 'scp-sp-apply-regex', type: 'checkbox', updCtx: true, profileKey: true },
       { key: 'reasoningTrimStrings', stId: 'scp-reasoning-trim', spId: 'scp-sp-reasoning-trim', type: 'textarea', profileKey: true },
 
@@ -9082,7 +9148,8 @@ ${scopeHtml}
       customKey: ['scp-sp-ov-custom-key'],           customModel: ['scp-sp-ov-custom-model'],
       connectionProfileId: ['scp-sp-ov-conn-profile'],
       includeSystemPrompt: ['scp-sp-ov-include-sysprompt'], includeUserPersonality: ['scp-sp-ov-include-persona'],
-      includeAlternateSwipes: ['scp-sp-ov-include-alt-swipes'], applyRegexToContext: ['scp-sp-ov-apply-regex'],
+      includeAlternateSwipes: ['scp-sp-ov-include-alt-swipes'], includeActivePreset: ['scp-sp-ov-include-active-preset'],
+      applyRegexToContext: ['scp-sp-ov-apply-regex'],
       charEditAIEnabled: ['scp-sp-ov-char-edit-enabled'], charEditPrompt: ['scp-sp-ov-char-edit-prompt'],
       lorebookAIManageEnabled: ['scp-sp-ov-lb-ai-enabled'], lorebookManagePrompt: ['scp-sp-ov-lb-manage-prompt'],
       lorebookAutoKeyword: ['scp-sp-ov-lb-auto-kw'], chatEditAIEnabled: ['scp-sp-ov-chat-edit-enabled'],
@@ -9692,7 +9759,7 @@ ${scopeHtml}
       ovi('scp-sp-ov-char-edit-prompt', 'charEditPrompt'); ovi('scp-sp-ov-lb-manage-prompt', 'lorebookManagePrompt'); ovi('scp-sp-ov-chat-edit-prompt', 'chatEditPrompt');
 
       gC('scp-sp-ov-include-sysprompt', eff.includeSystemPrompt); gC('scp-sp-ov-include-persona', eff.includeUserPersonality);
-      gC('scp-sp-ov-include-alt-swipes', eff.includeAlternateSwipes); gC('scp-sp-ov-apply-regex', eff.applyRegexToContext);
+      gC('scp-sp-ov-include-alt-swipes', eff.includeAlternateSwipes); gC('scp-sp-ov-include-active-preset', eff.includeActivePreset); gC('scp-sp-ov-apply-regex', eff.applyRegexToContext);
       gC('scp-sp-ov-char-edit-enabled',  'charEditAIEnabled'        in ov ? ov.charEditAIEnabled        : s.charEditAIEnabled);
       gC('scp-sp-ov-lb-ai-enabled',      'lorebookAIManageEnabled'  in ov ? ov.lorebookAIManageEnabled  : s.lorebookAIManageEnabled);
       gC('scp-sp-ov-chat-edit-enabled',  'chatEditAIEnabled'        in ov ? ov.chatEditAIEnabled        : s.chatEditAIEnabled);
@@ -10104,6 +10171,7 @@ ${scopeHtml}
       bindOv('scp-sp-ov-include-sysprompt',  'includeSystemPrompt',     true);
       bindOv('scp-sp-ov-include-persona',    'includeUserPersonality',   true);
       bindOv('scp-sp-ov-include-alt-swipes', 'includeAlternateSwipes',   true);
+      bindOv('scp-sp-ov-include-active-preset', 'includeActivePreset',  true);
       bindOv('scp-sp-ov-apply-regex',        'applyRegexToContext',      true);
       bindOv('scp-sp-ov-char-edit-enabled',  'charEditAIEnabled',        true);
       bindOv('scp-sp-ov-lb-ai-enabled',      'lorebookAIManageEnabled',  true);
@@ -14169,6 +14237,11 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       if (settings.includeSystemPrompt) {
           const sp = ctx.systemPrompt || ctx.system_prompt || '';
           if (sp) parts.push(`\n\n<st_system_prompt>\n${sp}\n</st_system_prompt>`);
+      }
+
+      if (settings.includeActivePreset) {
+          const presetBlock = buildActivePresetBlock();
+          if (presetBlock) parts.push(presetBlock);
       }
 
       if (ctx.groupId && ctx.groups) {

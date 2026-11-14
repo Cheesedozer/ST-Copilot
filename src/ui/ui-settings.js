@@ -80,6 +80,7 @@ const _SETTINGS_DEF = [
     { key: 'includeSystemPrompt', stId: 'scp-include-sysprompt', spId: 'scp-sp-include-sysprompt', type: 'checkbox', updCtx: true, profileKey: true },
     { key: 'includeUserPersonality', stId: 'scp-include-persona', spId: 'scp-sp-include-persona', type: 'checkbox', updCtx: true, profileKey: true },
     { key: 'includeAlternateSwipes', stId: 'scp-include-alt-swipes', spId: 'scp-sp-include-alt-swipes', type: 'checkbox', updCtx: true, profileKey: true },
+    { key: 'includeActivePreset', stId: 'scp-include-active-preset', spId: 'scp-sp-include-active-preset', type: 'checkbox', updCtx: true, profileKey: true },
     { key: 'applyRegexToContext', stId: 'scp-apply-regex', spId: 'scp-sp-apply-regex', type: 'checkbox', updCtx: true, profileKey: true },
     { key: 'reasoningTrimStrings', stId: 'scp-reasoning-trim', spId: 'scp-sp-reasoning-trim', type: 'textarea', profileKey: true },
 
@@ -160,7 +161,8 @@ const _OV_EL_MAP = {
     customKey: ['scp-sp-ov-custom-key'],           customModel: ['scp-sp-ov-custom-model'],
     connectionProfileId: ['scp-sp-ov-conn-profile'],
     includeSystemPrompt: ['scp-sp-ov-include-sysprompt'], includeUserPersonality: ['scp-sp-ov-include-persona'],
-    includeAlternateSwipes: ['scp-sp-ov-include-alt-swipes'], applyRegexToContext: ['scp-sp-ov-apply-regex'],
+    includeAlternateSwipes: ['scp-sp-ov-include-alt-swipes'], includeActivePreset: ['scp-sp-ov-include-active-preset'],
+    applyRegexToContext: ['scp-sp-ov-apply-regex'],
     charEditAIEnabled: ['scp-sp-ov-char-edit-enabled'], charEditPrompt: ['scp-sp-ov-char-edit-prompt'],
     lorebookAIManageEnabled: ['scp-sp-ov-lb-ai-enabled'], lorebookManagePrompt: ['scp-sp-ov-lb-manage-prompt'],
     lorebookAutoKeyword: ['scp-sp-ov-lb-auto-kw'], chatEditAIEnabled: ['scp-sp-ov-chat-edit-enabled'],
@@ -770,7 +772,7 @@ export function syncSPFromSettings() {
     ovi('scp-sp-ov-char-edit-prompt', 'charEditPrompt'); ovi('scp-sp-ov-lb-manage-prompt', 'lorebookManagePrompt'); ovi('scp-sp-ov-chat-edit-prompt', 'chatEditPrompt');
 
     gC('scp-sp-ov-include-sysprompt', eff.includeSystemPrompt); gC('scp-sp-ov-include-persona', eff.includeUserPersonality);
-    gC('scp-sp-ov-include-alt-swipes', eff.includeAlternateSwipes); gC('scp-sp-ov-apply-regex', eff.applyRegexToContext);
+    gC('scp-sp-ov-include-alt-swipes', eff.includeAlternateSwipes); gC('scp-sp-ov-include-active-preset', eff.includeActivePreset); gC('scp-sp-ov-apply-regex', eff.applyRegexToContext);
     gC('scp-sp-ov-char-edit-enabled',  'charEditAIEnabled'        in ov ? ov.charEditAIEnabled        : s.charEditAIEnabled);
     gC('scp-sp-ov-lb-ai-enabled',      'lorebookAIManageEnabled'  in ov ? ov.lorebookAIManageEnabled  : s.lorebookAIManageEnabled);
     gC('scp-sp-ov-chat-edit-enabled',  'chatEditAIEnabled'        in ov ? ov.chatEditAIEnabled        : s.chatEditAIEnabled);
@@ -1182,6 +1184,7 @@ export function setupSettingsPanelListeners() {
     bindOv('scp-sp-ov-include-sysprompt',  'includeSystemPrompt',     true);
     bindOv('scp-sp-ov-include-persona',    'includeUserPersonality',   true);
     bindOv('scp-sp-ov-include-alt-swipes', 'includeAlternateSwipes',   true);
+    bindOv('scp-sp-ov-include-active-preset', 'includeActivePreset',  true);
     bindOv('scp-sp-ov-apply-regex',        'applyRegexToContext',      true);
     bindOv('scp-sp-ov-char-edit-enabled',  'charEditAIEnabled',        true);
     bindOv('scp-sp-ov-lb-ai-enabled',      'lorebookAIManageEnabled',  true);

@@ -38,6 +38,7 @@ export function getSettings() {
         includeCharacterCard: true,
         includeUserPersonality: true,
         includeAlternateSwipes: false,
+        includeActivePreset: false,
         systemPrompt: '',
         memoryManagePrompt: '',
         profiles: {},

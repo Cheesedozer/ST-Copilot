@@ -147,6 +147,7 @@
           <label class="scp-sp-check"><input type="checkbox" id="scp-sp-auto-expand-macros"><span>Auto-expand macros in user input</span></label>
           <label class="scp-sp-check"><input type="checkbox" id="scp-sp-include-hidden-msgs"><span>Include hidden messages in context</span></label>
           <label class="scp-sp-check"><input type="checkbox" id="scp-sp-include-alt-swipes"><span>Include alternate swipes of the last message</span></label>
+          <label class="scp-sp-check" title="Send the name and enabled prompts of your active Chat/Text Completion preset, so edits fit how you actually play"><input type="checkbox" id="scp-sp-include-active-preset"><span>Include active preset <span class="scp-sp-hint">(can be large)</span></span></label>
           <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:5px">
             <div class="scp-sp-label" style="margin-bottom:2px">Character fields sent to AI context</div>
             <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ce-tags"><span>Tags</span></label>
@@ -376,6 +377,10 @@
             <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ov-include-alt-swipes"><span>Include alternate swipes of last message</span></label>
             <button class="scp-sp-ov-clear" data-ovkey="includeAlternateSwipes" title="Clear override" disabled>↺</button>
           </div>
+          <div class="scp-sp-ov-check-row">
+            <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ov-include-active-preset"><span>Include active preset</span></label>
+            <button class="scp-sp-ov-clear" data-ovkey="includeActivePreset" title="Clear override" disabled>↺</button>
+          </div>
           <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06)">
             <div class="scp-sp-label" style="margin-bottom:5px">Character fields <span class="scp-sp-hint">(override global)</span></div>
             <div class="scp-sp-ov-check-row">
@@ -581,4 +586,4 @@
     </div>
 
   </div>
-</div>
+</div>
