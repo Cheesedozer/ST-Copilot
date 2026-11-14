@@ -4,7 +4,7 @@ import { getSettings, getEffectiveSettings, saveSettings, getCurrentSession, sav
 import { _dbgAdd } from './utils/util-debug.js';
 import { escHtml } from './utils/util-dom.js';
 import { _ensureWrapped } from './utils/util-text.js';
-import { getCharInfo, getUserPersona } from './utils/util-st.js';
+import { getCharInfo, getUserPersona, buildActivePresetBlock } from './utils/util-st.js';
 import { recordStat, SM } from './features/feature-stats.js';
 import { _mergeContent } from './features/feature-attachments.js';
 
@@ -32,6 +32,11 @@ export async function buildSystemContent(settings) {
     if (settings.includeSystemPrompt) {
         const sp = ctx.systemPrompt || ctx.system_prompt || '';
         if (sp) parts.push(`\n\n<st_system_prompt>\n${sp}\n</st_system_prompt>`);
+    }
+
+    if (settings.includeActivePreset) {
+        const presetBlock = buildActivePresetBlock();
+        if (presetBlock) parts.push(presetBlock);
     }
 
     if (ctx.groupId && ctx.groups) {
@@ -1263,4 +1268,4 @@ export async function runContinue(session, targetMsgId) {
         state.generating = false;
         setGeneratingState(false);
     }
-}
+}
