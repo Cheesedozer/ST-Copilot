@@ -2,7 +2,7 @@ import { I, EXT_DISPLAY, THEME_PRESETS, WIN_ID } from '../constants.js';
 import { state } from '../state.js';
 import { getSettings, saveSettings, getCurrentSession, saveSessionsToMetadata, addMessage, deleteMsg, truncateAfter, truncateFrom, expandMacros, getEffectiveSettings, getBindingKey, initChatBucket, isBucketForCurrentChat, isMessageStarred, toggleStarMessage } from '../session.js';
 import { _dbgAdd } from '../utils/util-debug.js';
-import { escHtml, autoResize, showCustomDialog, copyText } from '../utils/util-dom.js';
+import { escHtml, autoResize, showCustomDialog, copyText, createRenderThrottle } from '../utils/util-dom.js';
 import { getCharInfo } from '../utils/util-st.js';
 import { applyRegexIfEnabled } from '../integrations/integ-regex.js';
 
@@ -16,7 +16,7 @@ import { parsePresetChangesFromText, stripPresetChangesBlock } from '../features
 import { renderPresetProposalCard, renderPresetResultCard } from '../features/feature-preset-ui.js';
 import { renderChatProposalCard } from '../features/feature-chatedit-ui.js';
 import { stripMemoryBlock } from '../features/feature-memory.js';
-import { parseToolCallsFromText } from '../features/feature-tools-engine.js';
+import { parseToolCallsFromText, getEnabledTools } from '../features/feature-tools-engine.js';
 import { postProcessToolCalls } from '../features/feature-tools-ui.js';
 import { recordStat, SM } from '../features/feature-stats.js';
 import { _processAttachmentsBeforeSend, _mergeContent, _renderAttachmentPreviews, _openImageLightbox, _openTextLightbox } from '../features/feature-attachments.js';
@@ -778,7 +778,8 @@ export async function _runSwipeRegen(session, msgId, wrapEl) {
     }
 
     let cursorEl = null;
-    const cleanupCursor = () => { if (cursorEl?.parentNode) cursorEl.remove(); cursorEl = null; };
+    const liveRender = createRenderThrottle();
+    const cleanupCursor = () => { liveRender.flush(); if (cursorEl?.parentNode) cursorEl.remove(); cursorEl = null; };
 
     const onChunk = (text, reasoning) => {
         if (!cursorEl) {
@@ -787,6 +788,10 @@ export async function _runSwipeRegen(session, msgId, wrapEl) {
             const bar = document.getElementById('scp-thinking-bar');
             if (bar) bar.style.display = 'flex';
         }
+        liveRender.schedule(() => renderSwipeChunk(text, reasoning));
+    };
+
+    const renderSwipeChunk = (text, reasoning) => {
         if (streamContentEl) {
             let procReasoning = reasoning || '';
             let procText = stripMemoryBlock(text);
@@ -802,7 +807,7 @@ export async function _runSwipeRegen(session, msgId, wrapEl) {
 
             const { content: disp } = getDisplayContent(procText, settings);
             streamContentEl.innerHTML = renderMarkdown(disp);
-            if (procText) streamContentEl.appendChild(cursorEl);
+            if (procText && cursorEl) streamContentEl.appendChild(cursorEl);
             postProcessHTMLBlocks(streamContentEl);
 
             if (tcIndex > 0) {
@@ -824,8 +829,17 @@ export async function _runSwipeRegen(session, msgId, wrapEl) {
         const fullPromptText = builtMessages.map(m => m.content).join('\n');
         const tokensIn = await apiMod.estimateTokens(fullPromptText);
 
-        const result = await apiMod.callGenerate(tempSession, settings, null, onChunk);
+        let result = await apiMod.callGenerate(tempSession, settings, null, onChunk);
         cleanupCursor();
+
+        // A regenerated reply may call tools too; run them like a normal send does.
+        if (result !== null && getEnabledTools().length > 0) {
+            const loop = await apiMod.runToolRounds({
+                session, settings, firstResult: result, excludeMsgId: msgId,
+                msgEl: wrapEl, contentEl: streamContentEl, liveRender,
+            });
+            result = loop.result;
+        }
 
         if (result === null) {
             msgData.swipes.pop();
@@ -844,6 +858,8 @@ export async function _runSwipeRegen(session, msgId, wrapEl) {
         msgData.swipes[msgData.swipeIndex] = { content: fullText, reasoning: fullReasoning || null };
         msgData.content = fullText;
         msgData.reasoning = fullReasoning || null;
+        msgData.toolCalls = state.activeToolCalls.length ? apiMod._compactToolCallsForStorage(state.activeToolCalls) : undefined;
+        state.activeToolCalls = [];
         saveSessionsToMetadata();
 
         _renderMsgBodyContent(wrapEl, msgData);

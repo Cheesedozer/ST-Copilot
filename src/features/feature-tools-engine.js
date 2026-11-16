@@ -317,6 +317,104 @@ export function parseToolCallsFromText(text) {
     return results;
 }
 
+// ─── Lenient parsing for running tools ───────────────────────────────────────
+// Models do not always use the exact ```tool_call format. Gemini tends to write ```tool_code
+// with a Python-style call, Hermes/Qwen-style models use <tool_call> tags, and some put JSON
+// with "arguments" in a ```json block. These are only accepted for known tool names.
+
+const KNOWN_TOOL_NAMES = () => new Set([...TOOL_DEFINITIONS.map(t => t.name), READ_PRESET_TOOL.name]);
+
+function _normalizeCall(obj, known) {
+    if (!obj || typeof obj !== 'object') return null;
+    const fn = obj.function && typeof obj.function === 'object' ? obj.function : obj;
+    const name = fn.name || obj.tool || obj.tool_name;
+    if (!name || !known.has(name)) return null;
+    let input = fn.input ?? fn.arguments ?? fn.parameters ?? fn.args ?? obj.input ?? {};
+    if (typeof input === 'string') { try { input = JSON.parse(input); } catch (_) { input = {}; } }
+    return { name, input: input && typeof input === 'object' ? input : {} };
+}
+
+// Python-ish value: True/False/None, quotes, numbers, lists, dicts.
+function _pyValue(raw) {
+    const v = raw.trim()
+        .replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')
+        .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, x) => JSON.stringify(x));
+    return JSON.parse(v);
+}
+
+function _splitTopLevel(str) {
+    const parts = [];
+    let depth = 0, quote = null, cur = '';
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+        if (quote) { cur += ch; if (ch === '\\') { cur += str[++i] ?? ''; } else if (ch === quote) quote = null; continue; }
+        if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+        if ('([{'.includes(ch)) depth++;
+        if (')]}'.includes(ch)) depth--;
+        if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+        cur += ch;
+    }
+    if (cur.trim()) parts.push(cur);
+    return parts;
+}
+
+function _parsePythonCall(src, known) {
+    // First call to a known tool name, e.g. inside print(default_api.read_preset(all=True)).
+    let name = null, argStart = -1;
+    for (const m of src.matchAll(/(\w+)\s*\(/g)) {
+        if (known.has(m[1])) { name = m[1]; argStart = m.index + m[0].length; break; }
+    }
+    if (!name) return null;
+    let depth = 1, i = argStart, quote = null;
+    for (; i < src.length && depth > 0; i++) {
+        const ch = src[i];
+        if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = null; continue; }
+        if (ch === '"' || ch === "'") quote = ch;
+        else if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+    }
+    const args = src.slice(argStart, depth === 0 ? i - 1 : i);
+    const input = {};
+    for (const part of _splitTopLevel(args)) {
+        const kv = part.match(/^\s*(\w+)\s*=\s*([\s\S]+)$/);
+        if (!kv) continue;
+        try { input[kv[1]] = _pyValue(kv[2]); } catch (_) { input[kv[1]] = kv[2].trim().replace(/^['"]|['"]$/g, ''); }
+    }
+    return { name, input };
+}
+
+function _parseCallBody(body, known) {
+    const raw = body.trim();
+    if (!raw) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        return (Array.isArray(parsed) ? parsed : [parsed]).map(x => _normalizeCall(x, known)).filter(Boolean);
+    } catch (_) { /* not JSON */ }
+    const py = _parsePythonCall(raw, known);
+    return py ? [py] : [];
+}
+
+// Tool calls to run for a reply: the standard format first, then common variants.
+export function parseToolCallsLenient(text) {
+    if (typeof text !== 'string' || !text) return [];
+    const known = KNOWN_TOOL_NAMES();
+    const strict = parseToolCallsFromText(text).filter(c => c.name !== 'parsing...');
+    if (strict.length) return strict;
+    const calls = [];
+    const fence = /```(?:tool_code|tool_use|tool_calls?|function_call|tool|python|json)[^\n]*\n([\s\S]*?)```/gi;
+    for (const m of text.matchAll(fence)) calls.push(..._parseCallBody(m[1], known));
+    const tags = /<(tool_call|function_call|tool_use)>([\s\S]*?)<\/\1>/gi;
+    for (const m of text.matchAll(tags)) calls.push(..._parseCallBody(m[2], known));
+    return calls;
+}
+
+// Whether a reply looks like it meant to call a tool (for diagnostics when nothing parsed).
+export function mentionsToolCall(text) {
+    if (typeof text !== 'string' || !text) return false;
+    if (/```tool|<tool_call>|<function_call>/i.test(text)) return true;
+    return [...KNOWN_TOOL_NAMES()].some(n => text.includes(n));
+}
+
 export function stripToolCallsFromText(text) {
     return text.replace(/```tool_call[\s\S]*?```/gi, '').trim();
 }

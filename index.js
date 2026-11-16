@@ -9914,6 +9914,104 @@ ${scopeHtml}
       return results;
   }
 
+  // ─── Lenient parsing for running tools ───────────────────────────────────────
+  // Models do not always use the exact ```tool_call format. Gemini tends to write ```tool_code
+  // with a Python-style call, Hermes/Qwen-style models use <tool_call> tags, and some put JSON
+  // with "arguments" in a ```json block. These are only accepted for known tool names.
+
+  const KNOWN_TOOL_NAMES = () => new Set([...TOOL_DEFINITIONS.map(t => t.name), READ_PRESET_TOOL.name]);
+
+  function _normalizeCall(obj, known) {
+      if (!obj || typeof obj !== 'object') return null;
+      const fn = obj.function && typeof obj.function === 'object' ? obj.function : obj;
+      const name = fn.name || obj.tool || obj.tool_name;
+      if (!name || !known.has(name)) return null;
+      let input = fn.input ?? fn.arguments ?? fn.parameters ?? fn.args ?? obj.input ?? {};
+      if (typeof input === 'string') { try { input = JSON.parse(input); } catch (_) { input = {}; } }
+      return { name, input: input && typeof input === 'object' ? input : {} };
+  }
+
+  // Python-ish value: True/False/None, quotes, numbers, lists, dicts.
+  function _pyValue(raw) {
+      const v = raw.trim()
+          .replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false').replace(/\bNone\b/g, 'null')
+          .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, x) => JSON.stringify(x));
+      return JSON.parse(v);
+  }
+
+  function _splitTopLevel(str) {
+      const parts = [];
+      let depth = 0, quote = null, cur = '';
+      for (let i = 0; i < str.length; i++) {
+          const ch = str[i];
+          if (quote) { cur += ch; if (ch === '\\') { cur += str[++i] ?? ''; } else if (ch === quote) quote = null; continue; }
+          if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue; }
+          if ('([{'.includes(ch)) depth++;
+          if (')]}'.includes(ch)) depth--;
+          if (ch === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+          cur += ch;
+      }
+      if (cur.trim()) parts.push(cur);
+      return parts;
+  }
+
+  function _parsePythonCall(src, known) {
+      // First call to a known tool name, e.g. inside print(default_api.read_preset(all=True)).
+      let name = null, argStart = -1;
+      for (const m of src.matchAll(/(\w+)\s*\(/g)) {
+          if (known.has(m[1])) { name = m[1]; argStart = m.index + m[0].length; break; }
+      }
+      if (!name) return null;
+      let depth = 1, i = argStart, quote = null;
+      for (; i < src.length && depth > 0; i++) {
+          const ch = src[i];
+          if (quote) { if (ch === '\\') i++; else if (ch === quote) quote = null; continue; }
+          if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === '(') depth++;
+          else if (ch === ')') depth--;
+      }
+      const args = src.slice(argStart, depth === 0 ? i - 1 : i);
+      const input = {};
+      for (const part of _splitTopLevel(args)) {
+          const kv = part.match(/^\s*(\w+)\s*=\s*([\s\S]+)$/);
+          if (!kv) continue;
+          try { input[kv[1]] = _pyValue(kv[2]); } catch (_) { input[kv[1]] = kv[2].trim().replace(/^['"]|['"]$/g, ''); }
+      }
+      return { name, input };
+  }
+
+  function _parseCallBody(body, known) {
+      const raw = body.trim();
+      if (!raw) return [];
+      try {
+          const parsed = JSON.parse(raw);
+          return (Array.isArray(parsed) ? parsed : [parsed]).map(x => _normalizeCall(x, known)).filter(Boolean);
+      } catch (_) { /* not JSON */ }
+      const py = _parsePythonCall(raw, known);
+      return py ? [py] : [];
+  }
+
+  // Tool calls to run for a reply: the standard format first, then common variants.
+  function parseToolCallsLenient(text) {
+      if (typeof text !== 'string' || !text) return [];
+      const known = KNOWN_TOOL_NAMES();
+      const strict = parseToolCallsFromText(text).filter(c => c.name !== 'parsing...');
+      if (strict.length) return strict;
+      const calls = [];
+      const fence = /```(?:tool_code|tool_use|tool_calls?|function_call|tool|python|json)[^\n]*\n([\s\S]*?)```/gi;
+      for (const m of text.matchAll(fence)) calls.push(..._parseCallBody(m[1], known));
+      const tags = /<(tool_call|function_call|tool_use)>([\s\S]*?)<\/\1>/gi;
+      for (const m of text.matchAll(tags)) calls.push(..._parseCallBody(m[2], known));
+      return calls;
+  }
+
+  // Whether a reply looks like it meant to call a tool (for diagnostics when nothing parsed).
+  function mentionsToolCall(text) {
+      if (typeof text !== 'string' || !text) return false;
+      if (/```tool|<tool_call>|<function_call>/i.test(text)) return true;
+      return [...KNOWN_TOOL_NAMES()].some(n => text.includes(n));
+  }
+
   function buildToolCallsSystemBlock() {
       const tools = getEnabledTools();
       if (!tools.length) return '';
@@ -12660,7 +12758,8 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       }
 
       let cursorEl = null;
-      const cleanupCursor = () => { if (cursorEl?.parentNode) cursorEl.remove(); cursorEl = null; };
+      const liveRender = createRenderThrottle();
+      const cleanupCursor = () => { liveRender.flush(); if (cursorEl?.parentNode) cursorEl.remove(); cursorEl = null; };
 
       const onChunk = (text, reasoning) => {
           if (!cursorEl) {
@@ -12669,6 +12768,10 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               const bar = document.getElementById('scp-thinking-bar');
               if (bar) bar.style.display = 'flex';
           }
+          liveRender.schedule(() => renderSwipeChunk(text, reasoning));
+      };
+
+      const renderSwipeChunk = (text, reasoning) => {
           if (streamContentEl) {
               let procReasoning = reasoning || '';
               let procText = stripMemoryBlock(text);
@@ -12684,7 +12787,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
 
               const { content: disp } = getDisplayContent(procText, settings);
               streamContentEl.innerHTML = renderMarkdown(disp);
-              if (procText) streamContentEl.appendChild(cursorEl);
+              if (procText && cursorEl) streamContentEl.appendChild(cursorEl);
               postProcessHTMLBlocks(streamContentEl);
 
               if (tcIndex > 0) {
@@ -12706,8 +12809,17 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const fullPromptText = builtMessages.map(m => m.content).join('\n');
           const tokensIn = await apiMod.estimateTokens(fullPromptText);
 
-          const result = await apiMod.callGenerate(tempSession, settings, null, onChunk);
+          let result = await apiMod.callGenerate(tempSession, settings, null, onChunk);
           cleanupCursor();
+
+          // A regenerated reply may call tools too; run them like a normal send does.
+          if (result !== null && getEnabledTools().length > 0) {
+              const loop = await apiMod.runToolRounds({
+                  session, settings, firstResult: result, excludeMsgId: msgId,
+                  msgEl: wrapEl, contentEl: streamContentEl, liveRender,
+              });
+              result = loop.result;
+          }
 
           if (result === null) {
               msgData.swipes.pop();
@@ -12726,6 +12838,8 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           msgData.swipes[msgData.swipeIndex] = { content: fullText, reasoning: fullReasoning || null };
           msgData.content = fullText;
           msgData.reasoning = fullReasoning || null;
+          msgData.toolCalls = state.activeToolCalls.length ? apiMod._compactToolCallsForStorage(state.activeToolCalls) : undefined;
+          state.activeToolCalls = [];
           saveSessionsToMetadata();
 
           _renderMsgBodyContent(wrapEl, msgData);
@@ -15336,6 +15450,29 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
 
       // Google: prompt blocked before generation.
       if (data.promptFeedback?.blockReason) diag.blockReason = data.promptFeedback.blockReason;
+      // How much text and thinking the provider actually sent, to compare with what
+      // SillyTavern handed to Copilot.
+      const addText = t => {
+          if (typeof t !== 'string' || !t) return;
+          diag.providerTextChars = (diag.providerTextChars || 0) + t.length;
+          if ((diag.providerTextHead || '').length < 400) diag.providerTextHead = ((diag.providerTextHead || '') + t).slice(0, 400);
+      };
+      const addThought = t => { if (typeof t === 'string' && t) diag.providerThoughtChars = (diag.providerThoughtChars || 0) + t.length; };
+      for (const part of data.candidates?.[0]?.content?.parts || []) {
+          if (part.thought) addThought(part.text);
+          else addText(part.text);
+          if (part.functionCall) diag.functionCall = part.functionCall.name || true;
+      }
+      for (const c of data.choices || []) {
+          addText(c.delta?.content ?? c.message?.content);
+          addThought(c.delta?.reasoning_content ?? c.delta?.reasoning ?? c.message?.reasoning_content ?? c.message?.reasoning);
+          if (c.delta?.tool_calls || c.message?.tool_calls) diag.functionCall = true;
+      }
+      if (data.type === 'content_block_delta') {
+          if (data.delta?.type === 'text_delta') addText(data.delta.text);
+          if (data.delta?.type === 'thinking_delta') addThought(data.delta.thinking);
+      }
+      if (Array.isArray(data.content)) for (const b of data.content) { if (b.type === 'text') addText(b.text); if (b.type === 'thinking') addThought(b.thinking); }
       // Google: finish reason per candidate.
       const cand = data.candidates?.[0];
       if (cand?.finishReason) diag.finishReason = cand.finishReason;
@@ -15396,6 +15533,9 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const extra = diag.finishMessage ? ` ${diag.finishMessage}` : '';
           return `The provider stopped the reply with no text (finish reason ${diag.finishReason}), which means its content filter blocked it.${extra} Try a different model for this request.`;
       }
+      if (diag.functionCall) return 'The model answered with a native function call instead of text, which Copilot does not use. Try again, or use a different model.';
+      if (diag.providerTextChars > 0) return `The provider sent ${diag.providerTextChars} characters of text, but SillyTavern passed none of it on. The text was: "${(diag.providerTextHead || '').slice(0, 120)}"`;
+      if (diag.providerThoughtChars > 0 && !isMaxTokensReason(diag.finishReason)) return `The model only produced hidden thinking (${diag.providerThoughtChars} characters) and no answer text. Try again, or turn on showing thoughts.`;
       if (isMaxTokensReason(diag.finishReason)) return null; // handled by the Max Tokens warning
       if (diag.finishReason) return `The provider ended the reply with no text (finish reason ${diag.finishReason}).`;
       return null;
@@ -16048,7 +16188,14 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           if (diag) {
               result.diag = diag;
               if (!result.isMaxTokens && isMaxTokensReason(diag.finishReason)) result.isMaxTokens = true;
-              _dbgAdd('GEN_PROVIDER_DIAG', { ...diag, textChars: result.text?.length || 0, hasReasoning: !!result.reasoning });
+              // Keep reply text out of the log unless the reply is short (empty or a lone tool call),
+              // which is exactly when seeing it is needed to diagnose a dead end.
+              const { providerTextHead, ...rest } = diag;
+              const short = (result.text?.length || 0) < 400;
+              _dbgAdd('GEN_PROVIDER_DIAG', {
+                  ...rest, textChars: result.text?.length || 0, hasReasoning: !!result.reasoning,
+                  ...(short ? { replyPreview: (result.text || '').slice(0, 400), providerTextHead } : {}),
+              });
           }
           return result;
       };
@@ -16228,6 +16375,174 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       });
   }
 
+  // Runs tool calls from a reply and feeds the results back, up to the configured number of
+  // rounds. Shared by normal sends and regenerated swipes. Returns the combined result.
+  async function runToolRounds({
+      session, settings, firstResult, excludeMsgId, msgEl, contentEl,
+      reasoningBlockEl = null, reasoningContentEl = null, liveRender, warnIfEmpty = () => {}, onRoundStart = () => {},
+  }) {
+      const maxRounds = settings.toolsMaxRounds ?? 5;
+      let result = firstResult;
+      let roundText = firstResult.text || '';
+      let roundReasoning = firstResult.reasoning;
+      let hitMaxTokens = !!firstResult.isMaxTokens;
+      let rounds = 0;
+      const extraHistory = [];
+
+      let accumulatedText = roundText;
+      let accumulatedReasoning = roundReasoning || null;
+
+      const _updateLiveUI = (tempText = '', tempReasoning = null) => {
+          if (!msgEl || !contentEl) return;
+          let combinedText = tempText ? accumulatedText + '\n\n' + tempText : accumulatedText;
+          let combinedReasoning = accumulatedReasoning || '';
+          if (tempReasoning) {
+              combinedReasoning = combinedReasoning ? combinedReasoning + '\n\n' + tempReasoning : tempReasoning;
+          }
+
+          let procReasoning = combinedReasoning;
+          let procText = stripMemoryBlock(combinedText);
+          let tcIndex = 0;
+
+          if (procReasoning) {
+              const resR = extractToolCallPlaceholders(procReasoning, tcIndex);
+              procReasoning = resR.text;
+              tcIndex = resR.nextIndex;
+          }
+          const resC = extractToolCallPlaceholders(procText, tcIndex);
+          procText = resC.text;
+
+          if (combinedReasoning && reasoningBlockEl && reasoningContentEl) {
+              reasoningBlockEl.style.display = '';
+              reasoningContentEl.innerHTML = renderMarkdown(procReasoning);
+              postProcessHTMLBlocks(reasoningContentEl);
+          }
+          contentEl.innerHTML = renderMarkdown(procText);
+          postProcessHTMLBlocks(contentEl);
+
+          if (state.activeToolCalls.length || tcIndex > 0) {
+              postProcessToolCalls(msgEl, state.activeToolCalls);
+          }
+          smartScrollToBottom();
+      };
+
+      for (let round = 0; round < maxRounds; round++) {
+          const { calls: tcs, fromReasoning } = _toolCallsForRound(roundText, roundReasoning);
+          if (!tcs.length) break;
+          rounds++;
+
+          const roundEntries = [];
+          for (const tc of tcs) {
+              const tcId = `tc_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+              const entry = { id: tcId, name: tc.name, input: tc.input, status: 'running', result: undefined };
+              state.activeToolCalls.push(entry);
+              roundEntries.push(entry);
+
+              _updateLiveUI();
+
+              try {
+                  if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
+                  const res = await executeTool(tc.name, tc.input);
+                  if (res?.__ask_user) {
+                      if (!msgEl) {
+                          entry.result = { warning: 'ask_user requires streaming to be enabled.' };
+                          entry.status = 'warning';
+                      } else {
+                          entry.result = await executeAskUser(res, msgEl);
+                          entry.status = 'done';
+                      }
+                  } else {
+                      entry.result = res;
+                      entry.status = 'done';
+                  }
+              } catch (e) {
+                  _dbgAdd('TOOL_EXECUTION_FAILED', { toolName: tc.name, error: e.message });
+                  entry.result = { error: e.message };
+                  entry.status = 'error';
+              }
+
+              _updateLiveUI();
+          }
+
+          // If the calls were only in the thinking, show the model its own calls next to the results.
+          const callEcho = fromReasoning ? '\n\n' + tcs.map(tc => '```tool_call\n' + JSON.stringify({ name: tc.name, input: tc.input }) + '\n```').join('\n') : '';
+          extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) + callEcho });
+          const toolResultsText = roundEntries.map(e => {
+              const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
+              return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
+          }).join("\n");
+
+          const lastRound = round === maxRounds - 1;
+          const nextStep = lastRound
+              ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
+              : 'CONTINUE your response using these results. Write exactly where you left off.';
+          extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
+
+          const thinkingText = document.getElementById('scp-thinking-text');
+          if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
+          const bar = document.getElementById('scp-thinking-bar');
+          if (bar) bar.style.display = 'flex';
+
+          for (const eh of extraHistory) {
+              session.messages.push({ id: `tc_hist_${Date.now()}`, role: eh.role, content: eh.content, timestamp: Date.now(), _tcTemp: true });
+          }
+
+          onRoundStart();
+          const cursor2 = document.createElement('span');
+          cursor2.className = 'scp-stream-cursor';
+
+          const tempSession = {
+              ...session,
+              messages: session.messages.filter(m => m.id !== excludeMsgId)
+          };
+
+          let nextResult;
+          try {
+              nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
+                  liveRender.schedule(() => {
+                      _updateLiveUI(t, r);
+                      if (contentEl) contentEl.appendChild(cursor2);
+                  });
+              });
+          } finally {
+              liveRender.flush();
+              session.messages = session.messages.filter(m => !m._tcTemp);
+              cursor2.remove();
+          }
+
+          if (nextResult === null) break;
+          hitMaxTokens = !!nextResult.isMaxTokens;
+          warnIfEmpty(nextResult);
+
+          roundText = nextResult.text || '';
+          roundReasoning = nextResult.reasoning || null;
+
+          accumulatedText += '\n\n' + roundText;
+          if (roundReasoning) {
+              accumulatedReasoning = accumulatedReasoning ? accumulatedReasoning + '\n\n' + roundReasoning : roundReasoning;
+          }
+
+          result = { text: accumulatedText, reasoning: accumulatedReasoning };
+      }
+
+      // Report a final reply that looks like it tried to call a tool we could not read.
+      if (!_toolCallsForRound(roundText, roundReasoning).calls.length && (mentionsToolCall(roundText) || /```tool|<tool_call>/i.test(roundReasoning || ''))) {
+          _dbgAdd('TOOL_CALL_UNPARSED', { round: rounds, textTail: roundText.slice(-400), reasoningTail: (roundReasoning || '').slice(-400) });
+      }
+
+      return { result, hitMaxTokens, rounds };
+  }
+
+  // Calls to run for one round: from the reply text, or, if the text has none, from the thinking
+  // (e.g. a reasoning template that captured an unclosed <think> holding the call).
+  function _toolCallsForRound(text, reasoning) {
+      const fromText = parseToolCallsLenient(text || '');
+      if (fromText.length) return { calls: fromText, fromReasoning: false };
+      const fromReasoning = parseToolCallsLenient(reasoning || '');
+      if (fromReasoning.length) _dbgAdd('TOOL_CALL_FROM_REASONING', { names: fromReasoning.map(c => c.name) });
+      return { calls: fromReasoning, fromReasoning: fromReasoning.length > 0 };
+  }
+
   async function runGenerate(session, userText, addUserMsg = true, processedAtts = null) {
       if (state.generating) return;
       state.generating = true;
@@ -16379,141 +16694,15 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           warnIfEmpty(result);
 
           if (result !== null && getEnabledTools().length > 0) {
-              const maxRounds = settings.toolsMaxRounds ?? 5;
-              let roundText = result.text || '';
-              let roundReasoning = result.reasoning;
-              let extraHistory = [];
-
-              let accumulatedText = roundText;
-              let accumulatedReasoning = roundReasoning || null;
-
-              const _updateLiveUI = (tempText = '', tempReasoning = null) => {
-                  if (!streamMsgEl || !streamContentEl) return;
-                  let combinedText = tempText ? accumulatedText + '\n\n' + tempText : accumulatedText;
-                  let combinedReasoning = accumulatedReasoning || '';
-                  if (tempReasoning) {
-                      combinedReasoning = combinedReasoning ? combinedReasoning + '\n\n' + tempReasoning : tempReasoning;
-                  }
-                  
-                  let procReasoning = combinedReasoning;
-                  let procText = stripMemoryBlock(combinedText);
-                  let tcIndex = 0;
-                  
-                  if (procReasoning) {
-                      const resR = extractToolCallPlaceholders(procReasoning, tcIndex);
-                      procReasoning = resR.text;
-                      tcIndex = resR.nextIndex;
-                  }
-                  const resC = extractToolCallPlaceholders(procText, tcIndex);
-                  procText = resC.text;
-
-                  if (combinedReasoning && streamReasoningBlockEl) {
-                      streamReasoningBlockEl.style.display = '';
-                      streamReasoningContentEl.innerHTML = renderMarkdown(procReasoning);
-                      postProcessHTMLBlocks(streamReasoningContentEl);
-                  }
-                  streamContentEl.innerHTML = renderMarkdown(procText);
-                  postProcessHTMLBlocks(streamContentEl);
-
-                  if (state.activeToolCalls.length || tcIndex > 0) {
-                      postProcessToolCalls(streamMsgEl, state.activeToolCalls);
-                  }
-                  smartScrollToBottom();
-              };
-
-              for (let round = 0; round < maxRounds; round++) {
-                  let tcs = parseToolCallsFromText(roundText);
-                  if (!tcs.length) break;
-
-                  const roundEntries = [];
-                  for (const tc of tcs) {
-                      const tcId = `tc_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-                      const entry = { id: tcId, name: tc.name, input: tc.input, status: 'running', result: undefined };
-                      state.activeToolCalls.push(entry);
-                      roundEntries.push(entry);
-                      
-                      _updateLiveUI();
-
-                      try {
-                          if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
-                          const res = await executeTool(tc.name, tc.input);
-                          if (res?.__ask_user) {
-                              if (!streamMsgEl) {
-                                  entry.result = { warning: 'ask_user requires streaming to be enabled.' };
-                                  entry.status = 'warning';
-                              } else {
-                                  entry.result = await executeAskUser(res, streamMsgEl);
-                                  entry.status = 'done';
-                              }
-                          } else {
-                              entry.result = res;
-                              entry.status = 'done';
-                          }
-                      } catch (e) {
-                          _dbgAdd('TOOL_EXECUTION_FAILED', { toolName: tc.name, error: e.message });
-                          entry.result = { error: e.message };
-                          entry.status = 'error';
-                      }
-                      
-                      _updateLiveUI();
-                  }
-
-                  extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) });
-                  const toolResultsText = roundEntries.map(e => {
-                      const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
-                      return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
-                  }).join("\n");
-
-                  const lastRound = round === maxRounds - 1;
-                  const nextStep = lastRound
-                      ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
-                      : 'CONTINUE your response using these results. Write exactly where you left off.';
-                  extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
-
-                  const thinkingText = document.getElementById('scp-thinking-text');
-                  if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
-                  const bar = document.getElementById('scp-thinking-bar');
-                  if (bar) bar.style.display = 'flex';
-
-                  for (const eh of extraHistory) {
-                      session.messages.push({ id: `tc_hist_${Date.now()}`, role: eh.role, content: eh.content, timestamp: Date.now(), _tcTemp: true });
-                  }
-
-                  isStreaming = false;
-                  streamAccumText = '';
-                  const cursor2 = document.createElement('span');
-                  cursor2.className = 'scp-stream-cursor';
-                  
-                  const tempSession = { 
-                      ...session, 
-                      messages: session.messages.filter(m => m.id !== streamMsgId) 
-                  };
-
-                  const nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
-                      liveRender.schedule(() => {
-                          _updateLiveUI(t, r);
-                          if (streamContentEl) streamContentEl.appendChild(cursor2);
-                      });
-                  });
-                  liveRender.flush();
-
-                  session.messages = session.messages.filter(m => !m._tcTemp);
-                  cursor2.remove();
-
-                  if (nextResult === null) break;
-                  hitMaxTokens = !!nextResult.isMaxTokens;
-                  warnIfEmpty(nextResult);
-
-                  roundText = nextResult.text || '';
-                  roundReasoning = nextResult.reasoning || null;
-                  
-                  accumulatedText += '\n\n' + roundText;
-                  if (roundReasoning) {
-                      accumulatedReasoning = accumulatedReasoning ? accumulatedReasoning + '\n\n' + roundReasoning : roundReasoning;
-                  }
-                  
-                  result = { text: accumulatedText, reasoning: accumulatedReasoning };
-              }
+              const loop = await runToolRounds({
+                  session, settings, firstResult: result, excludeMsgId: streamMsgId,
+                  msgEl: streamMsgEl, contentEl: streamContentEl,
+                  reasoningBlockEl: streamReasoningBlockEl, reasoningContentEl: streamReasoningContentEl,
+                  liveRender, warnIfEmpty,
+                  onRoundStart: () => { isStreaming = false; streamAccumText = ''; },
+              });
+              result = loop.result;
+              if (loop.rounds > 0) hitMaxTokens = loop.hitMaxTokens;
           }
 
           if (result === null) {
@@ -16768,6 +16957,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
   var api = /*#__PURE__*/Object.freeze({
     __proto__: null,
     _buildAiContextForHistoryMsg: _buildAiContextForHistoryMsg,
+    _compactToolCallsForStorage: _compactToolCallsForStorage,
     _getLiveConnection: _getLiveConnection,
     _joinContinuation: _joinContinuation,
     _liveChatCompletionFields: _liveChatCompletionFields,
@@ -16778,7 +16968,8 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
     formatPayloadAsText: formatPayloadAsText,
     getMainChatSlice: getMainChatSlice,
     runContinue: runContinue,
-    runGenerate: runGenerate
+    runGenerate: runGenerate,
+    runToolRounds: runToolRounds
   });
 
   // ─── Quick Prompts ───────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ import { buildLorebookContextBlock, buildLBAIInstructions, expandOutletsAsync } 
 import { buildCharacterContextBlock, buildCharEditAIInstructions } from './features/feature-character-engine.js';
 import { buildChatEditAIInstructions } from './features/feature-chatedit-engine.js';
 import { buildMemoryContextBlock, buildMemoryAIInstructions, processMemoryUpdates, stripMemoryBlock } from './features/feature-memory.js';
-import { buildToolCallsSystemBlock, parseToolCallsFromText, executeTool, getEnabledTools } from './features/feature-tools-engine.js';
+import { buildToolCallsSystemBlock, parseToolCallsFromText, parseToolCallsLenient, mentionsToolCall, executeTool, getEnabledTools } from './features/feature-tools-engine.js';
 import { getSessionPreset, setSessionPreset, buildPresetContextBlock, buildPresetEditAIInstructions, protectVerbatim, transformOutsideVerbatim } from './features/feature-preset-engine.js';
 
 import { updateMsgCount, smartScrollToBottom, setGeneratingState, showGenerationError, _renderMsgBodyContent, updateSwipeBar, _refreshSwipeBars, appendMsgEl } from './ui/ui-chat.js';
@@ -650,7 +650,14 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
         if (diag) {
             result.diag = diag;
             if (!result.isMaxTokens && isMaxTokensReason(diag.finishReason)) result.isMaxTokens = true;
-            _dbgAdd('GEN_PROVIDER_DIAG', { ...diag, textChars: result.text?.length || 0, hasReasoning: !!result.reasoning });
+            // Keep reply text out of the log unless the reply is short (empty or a lone tool call),
+            // which is exactly when seeing it is needed to diagnose a dead end.
+            const { providerTextHead, ...rest } = diag;
+            const short = (result.text?.length || 0) < 400;
+            _dbgAdd('GEN_PROVIDER_DIAG', {
+                ...rest, textChars: result.text?.length || 0, hasReasoning: !!result.reasoning,
+                ...(short ? { replyPreview: (result.text || '').slice(0, 400), providerTextHead } : {}),
+            });
         }
         return result;
     };
@@ -821,13 +828,181 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
 // Tool results are only shown in the UI after the turn (they are not resent to the model), so
 // long ones are trimmed before being saved with the message.
 const STORED_TOOL_RESULT_CHARS = 4000;
-function _compactToolCallsForStorage(toolCalls) {
+export function _compactToolCallsForStorage(toolCalls) {
     return toolCalls.map(tc => {
         const copy = JSON.parse(JSON.stringify(tc));
         const s = typeof copy.result === 'string' ? copy.result : (copy.result === undefined ? '' : JSON.stringify(copy.result));
         if (s.length > STORED_TOOL_RESULT_CHARS) copy.result = `${s.slice(0, STORED_TOOL_RESULT_CHARS)}\n… (${(s.length - STORED_TOOL_RESULT_CHARS).toLocaleString()} more characters not saved)`;
         return copy;
     });
+}
+
+// Runs tool calls from a reply and feeds the results back, up to the configured number of
+// rounds. Shared by normal sends and regenerated swipes. Returns the combined result.
+export async function runToolRounds({
+    session, settings, firstResult, excludeMsgId, msgEl, contentEl,
+    reasoningBlockEl = null, reasoningContentEl = null, liveRender, warnIfEmpty = () => {}, onRoundStart = () => {},
+}) {
+    const maxRounds = settings.toolsMaxRounds ?? 5;
+    let result = firstResult;
+    let roundText = firstResult.text || '';
+    let roundReasoning = firstResult.reasoning;
+    let hitMaxTokens = !!firstResult.isMaxTokens;
+    let rounds = 0;
+    const extraHistory = [];
+
+    let accumulatedText = roundText;
+    let accumulatedReasoning = roundReasoning || null;
+
+    const _updateLiveUI = (tempText = '', tempReasoning = null) => {
+        if (!msgEl || !contentEl) return;
+        let combinedText = tempText ? accumulatedText + '\n\n' + tempText : accumulatedText;
+        let combinedReasoning = accumulatedReasoning || '';
+        if (tempReasoning) {
+            combinedReasoning = combinedReasoning ? combinedReasoning + '\n\n' + tempReasoning : tempReasoning;
+        }
+
+        let procReasoning = combinedReasoning;
+        let procText = stripMemoryBlock(combinedText);
+        let tcIndex = 0;
+
+        if (procReasoning) {
+            const resR = extractToolCallPlaceholders(procReasoning, tcIndex);
+            procReasoning = resR.text;
+            tcIndex = resR.nextIndex;
+        }
+        const resC = extractToolCallPlaceholders(procText, tcIndex);
+        procText = resC.text;
+
+        if (combinedReasoning && reasoningBlockEl && reasoningContentEl) {
+            reasoningBlockEl.style.display = '';
+            reasoningContentEl.innerHTML = renderMarkdown(procReasoning);
+            postProcessHTMLBlocks(reasoningContentEl);
+        }
+        contentEl.innerHTML = renderMarkdown(procText);
+        postProcessHTMLBlocks(contentEl);
+
+        if (state.activeToolCalls.length || tcIndex > 0) {
+            postProcessToolCalls(msgEl, state.activeToolCalls);
+        }
+        smartScrollToBottom();
+    };
+
+    for (let round = 0; round < maxRounds; round++) {
+        const { calls: tcs, fromReasoning } = _toolCallsForRound(roundText, roundReasoning);
+        if (!tcs.length) break;
+        rounds++;
+
+        const roundEntries = [];
+        for (const tc of tcs) {
+            const tcId = `tc_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+            const entry = { id: tcId, name: tc.name, input: tc.input, status: 'running', result: undefined };
+            state.activeToolCalls.push(entry);
+            roundEntries.push(entry);
+
+            _updateLiveUI();
+
+            try {
+                if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
+                const res = await executeTool(tc.name, tc.input);
+                if (res?.__ask_user) {
+                    if (!msgEl) {
+                        entry.result = { warning: 'ask_user requires streaming to be enabled.' };
+                        entry.status = 'warning';
+                    } else {
+                        entry.result = await executeAskUser(res, msgEl);
+                        entry.status = 'done';
+                    }
+                } else {
+                    entry.result = res;
+                    entry.status = 'done';
+                }
+            } catch (e) {
+                _dbgAdd('TOOL_EXECUTION_FAILED', { toolName: tc.name, error: e.message });
+                entry.result = { error: e.message };
+                entry.status = 'error';
+            }
+
+            _updateLiveUI();
+        }
+
+        // If the calls were only in the thinking, show the model its own calls next to the results.
+        const callEcho = fromReasoning ? '\n\n' + tcs.map(tc => '```tool_call\n' + JSON.stringify({ name: tc.name, input: tc.input }) + '\n```').join('\n') : '';
+        extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) + callEcho });
+        const toolResultsText = roundEntries.map(e => {
+            const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
+            return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
+        }).join("\n");
+
+        const lastRound = round === maxRounds - 1;
+        const nextStep = lastRound
+            ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
+            : 'CONTINUE your response using these results. Write exactly where you left off.';
+        extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
+
+        const thinkingText = document.getElementById('scp-thinking-text');
+        if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
+        const bar = document.getElementById('scp-thinking-bar');
+        if (bar) bar.style.display = 'flex';
+
+        for (const eh of extraHistory) {
+            session.messages.push({ id: `tc_hist_${Date.now()}`, role: eh.role, content: eh.content, timestamp: Date.now(), _tcTemp: true });
+        }
+
+        onRoundStart();
+        const cursor2 = document.createElement('span');
+        cursor2.className = 'scp-stream-cursor';
+
+        const tempSession = {
+            ...session,
+            messages: session.messages.filter(m => m.id !== excludeMsgId)
+        };
+
+        let nextResult;
+        try {
+            nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
+                liveRender.schedule(() => {
+                    _updateLiveUI(t, r);
+                    if (contentEl) contentEl.appendChild(cursor2);
+                });
+            });
+        } finally {
+            liveRender.flush();
+            session.messages = session.messages.filter(m => !m._tcTemp);
+            cursor2.remove();
+        }
+
+        if (nextResult === null) break;
+        hitMaxTokens = !!nextResult.isMaxTokens;
+        warnIfEmpty(nextResult);
+
+        roundText = nextResult.text || '';
+        roundReasoning = nextResult.reasoning || null;
+
+        accumulatedText += '\n\n' + roundText;
+        if (roundReasoning) {
+            accumulatedReasoning = accumulatedReasoning ? accumulatedReasoning + '\n\n' + roundReasoning : roundReasoning;
+        }
+
+        result = { text: accumulatedText, reasoning: accumulatedReasoning };
+    }
+
+    // Report a final reply that looks like it tried to call a tool we could not read.
+    if (!_toolCallsForRound(roundText, roundReasoning).calls.length && (mentionsToolCall(roundText) || /```tool|<tool_call>/i.test(roundReasoning || ''))) {
+        _dbgAdd('TOOL_CALL_UNPARSED', { round: rounds, textTail: roundText.slice(-400), reasoningTail: (roundReasoning || '').slice(-400) });
+    }
+
+    return { result, hitMaxTokens, rounds };
+}
+
+// Calls to run for one round: from the reply text, or, if the text has none, from the thinking
+// (e.g. a reasoning template that captured an unclosed <think> holding the call).
+function _toolCallsForRound(text, reasoning) {
+    const fromText = parseToolCallsLenient(text || '');
+    if (fromText.length) return { calls: fromText, fromReasoning: false };
+    const fromReasoning = parseToolCallsLenient(reasoning || '');
+    if (fromReasoning.length) _dbgAdd('TOOL_CALL_FROM_REASONING', { names: fromReasoning.map(c => c.name) });
+    return { calls: fromReasoning, fromReasoning: fromReasoning.length > 0 };
 }
 
 export async function runGenerate(session, userText, addUserMsg = true, processedAtts = null) {
@@ -981,141 +1156,15 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
         warnIfEmpty(result);
 
         if (result !== null && getEnabledTools().length > 0) {
-            const maxRounds = settings.toolsMaxRounds ?? 5;
-            let roundText = result.text || '';
-            let roundReasoning = result.reasoning;
-            let extraHistory = [];
-
-            let accumulatedText = roundText;
-            let accumulatedReasoning = roundReasoning || null;
-
-            const _updateLiveUI = (tempText = '', tempReasoning = null) => {
-                if (!streamMsgEl || !streamContentEl) return;
-                let combinedText = tempText ? accumulatedText + '\n\n' + tempText : accumulatedText;
-                let combinedReasoning = accumulatedReasoning || '';
-                if (tempReasoning) {
-                    combinedReasoning = combinedReasoning ? combinedReasoning + '\n\n' + tempReasoning : tempReasoning;
-                }
-                
-                let procReasoning = combinedReasoning;
-                let procText = stripMemoryBlock(combinedText);
-                let tcIndex = 0;
-                
-                if (procReasoning) {
-                    const resR = extractToolCallPlaceholders(procReasoning, tcIndex);
-                    procReasoning = resR.text;
-                    tcIndex = resR.nextIndex;
-                }
-                const resC = extractToolCallPlaceholders(procText, tcIndex);
-                procText = resC.text;
-
-                if (combinedReasoning && streamReasoningBlockEl) {
-                    streamReasoningBlockEl.style.display = '';
-                    streamReasoningContentEl.innerHTML = renderMarkdown(procReasoning);
-                    postProcessHTMLBlocks(streamReasoningContentEl);
-                }
-                streamContentEl.innerHTML = renderMarkdown(procText);
-                postProcessHTMLBlocks(streamContentEl);
-
-                if (state.activeToolCalls.length || tcIndex > 0) {
-                    postProcessToolCalls(streamMsgEl, state.activeToolCalls);
-                }
-                smartScrollToBottom();
-            };
-
-            for (let round = 0; round < maxRounds; round++) {
-                let tcs = parseToolCallsFromText(roundText);
-                if (!tcs.length) break;
-
-                const roundEntries = [];
-                for (const tc of tcs) {
-                    const tcId = `tc_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
-                    const entry = { id: tcId, name: tc.name, input: tc.input, status: 'running', result: undefined };
-                    state.activeToolCalls.push(entry);
-                    roundEntries.push(entry);
-                    
-                    _updateLiveUI();
-
-                    try {
-                        if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
-                        const res = await executeTool(tc.name, tc.input);
-                        if (res?.__ask_user) {
-                            if (!streamMsgEl) {
-                                entry.result = { warning: 'ask_user requires streaming to be enabled.' };
-                                entry.status = 'warning';
-                            } else {
-                                entry.result = await executeAskUser(res, streamMsgEl);
-                                entry.status = 'done';
-                            }
-                        } else {
-                            entry.result = res;
-                            entry.status = 'done';
-                        }
-                    } catch (e) {
-                        _dbgAdd('TOOL_EXECUTION_FAILED', { toolName: tc.name, error: e.message });
-                        entry.result = { error: e.message };
-                        entry.status = 'error';
-                    }
-                    
-                    _updateLiveUI();
-                }
-
-                extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) });
-                const toolResultsText = roundEntries.map(e => {
-                    const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
-                    return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
-                }).join("\n");
-
-                const lastRound = round === maxRounds - 1;
-                const nextStep = lastRound
-                    ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
-                    : 'CONTINUE your response using these results. Write exactly where you left off.';
-                extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
-
-                const thinkingText = document.getElementById('scp-thinking-text');
-                if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
-                const bar = document.getElementById('scp-thinking-bar');
-                if (bar) bar.style.display = 'flex';
-
-                for (const eh of extraHistory) {
-                    session.messages.push({ id: `tc_hist_${Date.now()}`, role: eh.role, content: eh.content, timestamp: Date.now(), _tcTemp: true });
-                }
-
-                isStreaming = false;
-                streamAccumText = '';
-                const cursor2 = document.createElement('span');
-                cursor2.className = 'scp-stream-cursor';
-                
-                const tempSession = { 
-                    ...session, 
-                    messages: session.messages.filter(m => m.id !== streamMsgId) 
-                };
-
-                const nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
-                    liveRender.schedule(() => {
-                        _updateLiveUI(t, r);
-                        if (streamContentEl) streamContentEl.appendChild(cursor2);
-                    });
-                });
-                liveRender.flush();
-
-                session.messages = session.messages.filter(m => !m._tcTemp);
-                cursor2.remove();
-
-                if (nextResult === null) break;
-                hitMaxTokens = !!nextResult.isMaxTokens;
-                warnIfEmpty(nextResult);
-
-                roundText = nextResult.text || '';
-                roundReasoning = nextResult.reasoning || null;
-                
-                accumulatedText += '\n\n' + roundText;
-                if (roundReasoning) {
-                    accumulatedReasoning = accumulatedReasoning ? accumulatedReasoning + '\n\n' + roundReasoning : roundReasoning;
-                }
-                
-                result = { text: accumulatedText, reasoning: accumulatedReasoning };
-            }
+            const loop = await runToolRounds({
+                session, settings, firstResult: result, excludeMsgId: streamMsgId,
+                msgEl: streamMsgEl, contentEl: streamContentEl,
+                reasoningBlockEl: streamReasoningBlockEl, reasoningContentEl: streamReasoningContentEl,
+                liveRender, warnIfEmpty,
+                onRoundStart: () => { isStreaming = false; streamAccumText = ''; },
+            });
+            result = loop.result;
+            if (loop.rounds > 0) hitMaxTokens = loop.hitMaxTokens;
         }
 
         if (result === null) {
