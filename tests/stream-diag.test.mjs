@@ -46,3 +46,19 @@ test('reads a real Response object and never throws', async () => {
     const broken = await diagnoseResponse({ status: 0, text: () => Promise.reject(new Error('aborted')) });
     assert.deepEqual(broken, { httpStatus: 0 });
 });
+
+test('counts provider text and thinking, and explains text SillyTavern dropped', () => {
+    const d = diagnoseResponseText(sse(
+        { candidates: [{ content: { parts: [{ text: 'thinking…', thought: true }] } }] },
+        { candidates: [{ content: { parts: [{ text: 'Hello there' }] }, finishReason: 'STOP' }] },
+    ));
+    assert.equal(d.providerThoughtChars, 9);
+    assert.equal(d.providerTextChars, 11);
+    assert.match(explainEmptyReply(d), /sent 11 characters of text, but SillyTavern passed none of it on. The text was: "Hello there"/);
+    const thoughtOnly = diagnoseResponseText(sse({ choices: [{ delta: { reasoning_content: 'hmm' } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }] }));
+    assert.match(explainEmptyReply(thoughtOnly), /only produced hidden thinking/);
+    const fn = diagnoseResponseText(sse({ candidates: [{ content: { parts: [{ functionCall: { name: 'x', args: {} } }] }, finishReason: 'STOP' }] }));
+    assert.match(explainEmptyReply(fn), /native function call/);
+    const claude = diagnoseResponseText(sse({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'abc' } }));
+    assert.equal(claude.providerTextChars, 3);
+});

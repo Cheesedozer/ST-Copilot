@@ -27,6 +27,29 @@ export function collectDiagnostics(diag, data) {
 
     // Google: prompt blocked before generation.
     if (data.promptFeedback?.blockReason) diag.blockReason = data.promptFeedback.blockReason;
+    // How much text and thinking the provider actually sent, to compare with what
+    // SillyTavern handed to Copilot.
+    const addText = t => {
+        if (typeof t !== 'string' || !t) return;
+        diag.providerTextChars = (diag.providerTextChars || 0) + t.length;
+        if ((diag.providerTextHead || '').length < 400) diag.providerTextHead = ((diag.providerTextHead || '') + t).slice(0, 400);
+    };
+    const addThought = t => { if (typeof t === 'string' && t) diag.providerThoughtChars = (diag.providerThoughtChars || 0) + t.length; };
+    for (const part of data.candidates?.[0]?.content?.parts || []) {
+        if (part.thought) addThought(part.text);
+        else addText(part.text);
+        if (part.functionCall) diag.functionCall = part.functionCall.name || true;
+    }
+    for (const c of data.choices || []) {
+        addText(c.delta?.content ?? c.message?.content);
+        addThought(c.delta?.reasoning_content ?? c.delta?.reasoning ?? c.message?.reasoning_content ?? c.message?.reasoning);
+        if (c.delta?.tool_calls || c.message?.tool_calls) diag.functionCall = true;
+    }
+    if (data.type === 'content_block_delta') {
+        if (data.delta?.type === 'text_delta') addText(data.delta.text);
+        if (data.delta?.type === 'thinking_delta') addThought(data.delta.thinking);
+    }
+    if (Array.isArray(data.content)) for (const b of data.content) { if (b.type === 'text') addText(b.text); if (b.type === 'thinking') addThought(b.thinking); }
     // Google: finish reason per candidate.
     const cand = data.candidates?.[0];
     if (cand?.finishReason) diag.finishReason = cand.finishReason;
@@ -87,6 +110,9 @@ export function explainEmptyReply(diag) {
         const extra = diag.finishMessage ? ` ${diag.finishMessage}` : '';
         return `The provider stopped the reply with no text (finish reason ${diag.finishReason}), which means its content filter blocked it.${extra} Try a different model for this request.`;
     }
+    if (diag.functionCall) return 'The model answered with a native function call instead of text, which Copilot does not use. Try again, or use a different model.';
+    if (diag.providerTextChars > 0) return `The provider sent ${diag.providerTextChars} characters of text, but SillyTavern passed none of it on. The text was: "${(diag.providerTextHead || '').slice(0, 120)}"`;
+    if (diag.providerThoughtChars > 0 && !isMaxTokensReason(diag.finishReason)) return `The model only produced hidden thinking (${diag.providerThoughtChars} characters) and no answer text. Try again, or turn on showing thoughts.`;
     if (isMaxTokensReason(diag.finishReason)) return null; // handled by the Max Tokens warning
     if (diag.finishReason) return `The provider ended the reply with no text (finish reason ${diag.finishReason}).`;
     return null;
