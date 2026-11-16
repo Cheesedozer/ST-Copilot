@@ -3,6 +3,7 @@ import { state } from './state.js';
 import { getSettings, getEffectiveSettings, saveSettings, getCurrentSession, saveSessionsToMetadata, addMessage, expandMacros } from './session.js';
 import { _dbgAdd } from './utils/util-debug.js';
 import { escHtml, createRenderThrottle } from './utils/util-dom.js';
+import { diagnoseResponse, isMaxTokensReason, explainEmptyReply } from './utils/util-stream-diag.js';
 import { _ensureWrapped } from './utils/util-text.js';
 import { getCharInfo, getUserPersona, buildActivePresetBlock } from './utils/util-st.js';
 import { recordStat, SM } from './features/feature-stats.js';
@@ -642,6 +643,17 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
 
     let asyncGeneratorFn;
     const origFetch = window.fetch;
+    // Background read of a clone of the provider response, to learn why it stopped.
+    let diagPromise = null;
+    const withDiag = async result => {
+        const diag = diagPromise ? await Promise.race([diagPromise, new Promise(r => setTimeout(() => r(null), 2000))]) : null;
+        if (diag) {
+            result.diag = diag;
+            if (!result.isMaxTokens && isMaxTokensReason(diag.finishReason)) result.isMaxTokens = true;
+            _dbgAdd('GEN_PROVIDER_DIAG', { ...diag, textChars: result.text?.length || 0, hasReasoning: !!result.reasoning });
+        }
+        return result;
+    };
     
     window.fetch = async function(...args) {
         let requestUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
@@ -682,7 +694,11 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
                 if (changed) args[1].body = JSON.stringify(reqBody);
             } catch(_) {}
         }
-        return origFetch.apply(this, args);
+        const res = await origFetch.apply(this, args);
+        if (requestUrl.includes('/generate')) {
+            try { diagPromise = diagnoseResponse(res.clone()); } catch (_) {}
+        }
+        return res;
     };
 
     try {
@@ -754,7 +770,7 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
         const isMaxTokens = finishReason === 'length' || finishReason === 'max_tokens' || finishReason === 'stop_limit';
 
         state.abortController = null;
-        return { text, reasoning, isMaxTokens };
+        return withDiag({ text, reasoning, isMaxTokens });
     }
 
     const gen = typeof asyncGeneratorFn === 'function' ? asyncGeneratorFn() : asyncGeneratorFn;
@@ -799,7 +815,7 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
     const isMaxTokens = finishReason === 'length' || finishReason === 'max_tokens' || finishReason === 'stop_limit';
 
     state.abortController = null;
-    return { text: text.trim(), reasoning, isMaxTokens };
+    return withDiag({ text: text.trim(), reasoning, isMaxTokens });
 }
 
 // Tool results are only shown in the UI after the turn (they are not resent to the model), so
@@ -954,10 +970,15 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
 
         cleanupCursor();
         let hitMaxTokens = !!result?.isMaxTokens;
-        
-        if (result && !result.text.trim() && !result.reasoning?.trim()) {
-            toastr.warning('⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: 10000 });
-        }
+
+        // An empty reply is usually a provider block or an error SillyTavern swallowed while
+        // streaming; say which when the response tells us.
+        const warnIfEmpty = res => {
+            if (!res || res.text.trim() || res.reasoning?.trim()) return;
+            const why = explainEmptyReply(res.diag);
+            toastr.warning(why ? `⚠ The AI returned no text. ${why}` : '⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: why ? 30000 : 10000 });
+        };
+        warnIfEmpty(result);
 
         if (result !== null && getEnabledTools().length > 0) {
             const maxRounds = settings.toolsMaxRounds ?? 5;
@@ -1083,6 +1104,7 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
 
                 if (nextResult === null) break;
                 hitMaxTokens = !!nextResult.isMaxTokens;
+                warnIfEmpty(nextResult);
 
                 roundText = nextResult.text || '';
                 roundReasoning = nextResult.reasoning || null;
