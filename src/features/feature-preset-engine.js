@@ -267,6 +267,7 @@ Never output the whole preset or raw preset JSON. End your reply with one \`pres
 <rules>
 - Refer to prompts by their id attribute exactly as shown in the outline.
 - Before editing text, make sure you have the exact current text: if the outline only shows a preview, call read_preset first.
+- To review or analyze the whole preset, call read_preset once with {"all": true} (enabled prompts; add "include_disabled": true for every prompt) instead of reading prompts one by one. Tool rounds are limited.
 - edit_prompt with a body changes text. Use one or more ANCHOR/REPLACE patches; each ANCHOR must be copied exactly from the current text and appear only once in that prompt (include more surrounding text if needed). For long passages you may write "first few words || last few words". A body without ANCHOR markers replaces the whole prompt text.
 - edit_prompt attributes change settings: enabled, name, role (system/user/assistant), position (relative or in_chat) with depth and order. A self-closing edit_prompt changes only those attributes.
 - Turning a prompt on or off only needs enabled="true|false"; never rewrite its text for that.
@@ -319,9 +320,41 @@ export function findRegex(data, ref) {
 
 const toList = v => (Array.isArray(v) ? v : (v === undefined || v === null || v === '' ? [] : [v]));
 
+// Cap for read_preset {"all": true} (~60k tokens); anything beyond is listed so the model can
+// read it by id in a later call.
+export const PRESET_READ_ALL_CHAR_CAP = 240000;
+
+function readAllPrompts(data, includeDisabled) {
+    const byId = new Map(data.prompts.map(p => [p.identifier, p]));
+    const order = getPrimaryOrder(data)?.order || [];
+    const picked = [];
+    const seen = new Set();
+    for (const e of order) {
+        const p = byId.get(e?.identifier);
+        if (!p || seen.has(p.identifier)) continue;
+        seen.add(p.identifier);
+        if (p.marker || !(typeof p.content === 'string' && p.content.trim())) continue;
+        if (!e.enabled && !includeDisabled) continue;
+        picked.push({ p, enabled: !!e.enabled });
+    }
+    const out = [];
+    const skipped = [];
+    let used = 0;
+    for (const { p, enabled } of picked) {
+        if (used + p.content.length > PRESET_READ_ALL_CHAR_CAP && out.length) { skipped.push(p); continue; }
+        used += p.content.length;
+        out.push(`<prompt id="${escAttr(p.identifier)}" name="${escAttr(p.name || '')}" role="${escAttr(p.role || 'system')}" enabled="${enabled}" chars="${p.content.length}">\n${p.content}\n</prompt>`);
+    }
+    const scope = includeDisabled ? 'all prompts with text' : 'enabled prompts with text';
+    let head = `${out.length} ${scope}, in prompt order.`;
+    if (skipped.length) head += ` ${skipped.length} more did not fit in one result; read them by id: ${skipped.map(p => p.identifier).join(', ')}`;
+    return [head, ...out].join('\n\n');
+}
+
 export function readPresetItems(preset, input = {}) {
     if (!preset) return 'No preset is attached in this Copilot session.';
     const data = preset.data;
+    if (input.all === true || input.all === 'true') return readAllPrompts(data, input.include_disabled === true || input.include_disabled === 'true');
     const out = [];
     const promptRefs = [...toList(input.prompts), ...toList(input.prompt), ...toList(input.ids)];
     const regexRefs = [...toList(input.regex), ...toList(input.regex_scripts)];
@@ -337,7 +370,7 @@ export function readPresetItems(preset, input = {}) {
         const places = (r.placement || []).map(n => REGEX_PLACEMENT[n] || n).join(',');
         out.push(`<regex id="${escAttr(r.id)}" name="${escAttr(r.scriptName || '')}" placement="${places}" disabled="${!!r.disabled}">\n<find>${r.findRegex ?? ''}</find>\n<replace>${r.replaceString ?? ''}</replace>\n</regex>`);
     }
-    if (!out.length) return 'Pass "prompts" (ids or names) and/or "regex" (ids or names) to read.';
+    if (!out.length) return 'Pass "all": true, "prompts" (ids or names) and/or "regex" (ids or names) to read.';
     return out.join('\n\n');
 }
 

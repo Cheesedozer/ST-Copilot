@@ -247,3 +247,35 @@ test('an attached preset becomes a placeholder plus payload; other JSON stays a 
         assert.equal(other.textContent, '{"a": "{{outlet::X}}"}');
     } finally { delete globalThis.__stContext; }
 });
+
+test('read_preset all returns enabled prompts with text in order', async () => {
+    const { PRESET_READ_ALL_CHAR_CAP } = await import('../src/features/feature-preset-engine.js');
+    const data = basePreset();
+    data.prompt_order[1].order.find(e => e.identifier === 'abc-1').enabled = false;
+    let out = readPresetItems(sessionPreset(data), { all: true });
+    assert.match(out, /^1 enabled prompts with text/);
+    assert.match(out, /<prompt id="main"/);
+    assert.doesNotMatch(out, /abc-1|abc-2|chatHistory/, 'disabled and marker prompts are left out');
+    out = readPresetItems(sessionPreset(data), { all: true, include_disabled: true });
+    assert.match(out, /<prompt id="main"[\s\S]*<prompt id="abc-1"[^>]*enabled="false"/);
+
+    data.prompt_order[1].order.find(e => e.identifier === 'abc-1').enabled = true;
+    data.prompts[0].content = 'x'.repeat(PRESET_READ_ALL_CHAR_CAP);
+    out = readPresetItems(sessionPreset(data), { all: true });
+    assert.match(out, /1 more did not fit in one result; read them by id: abc-1/);
+});
+
+test('render throttle coalesces updates and flush runs the latest one', async () => {
+    const { createRenderThrottle } = await import('../src/utils/util-dom.js');
+    const t = createRenderThrottle(30);
+    const seen = [];
+    for (let i = 0; i < 50; i++) t.schedule(() => seen.push(i));
+    await new Promise(r => setTimeout(r, 60));
+    assert.deepEqual(seen, [49]);
+    t.schedule(() => seen.push('a'));
+    t.schedule(() => seen.push('b'));
+    t.flush();
+    assert.deepEqual(seen, [49, 'b']);
+    t.flush();
+    assert.deepEqual(seen, [49, 'b'], 'nothing pending, nothing runs');
+});

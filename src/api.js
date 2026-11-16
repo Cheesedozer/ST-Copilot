@@ -2,7 +2,7 @@ import { DEFAULT_SYSTEM_PROMPT, EXT_DISPLAY } from './constants.js';
 import { state } from './state.js';
 import { getSettings, getEffectiveSettings, saveSettings, getCurrentSession, saveSessionsToMetadata, addMessage, expandMacros } from './session.js';
 import { _dbgAdd } from './utils/util-debug.js';
-import { escHtml } from './utils/util-dom.js';
+import { escHtml, createRenderThrottle } from './utils/util-dom.js';
 import { _ensureWrapped } from './utils/util-text.js';
 import { getCharInfo, getUserPersona, buildActivePresetBlock } from './utils/util-st.js';
 import { recordStat, SM } from './features/feature-stats.js';
@@ -802,6 +802,18 @@ export async function callGenerate(session, settings, pendingText, onChunk) {
     return { text: text.trim(), reasoning, isMaxTokens };
 }
 
+// Tool results are only shown in the UI after the turn (they are not resent to the model), so
+// long ones are trimmed before being saved with the message.
+const STORED_TOOL_RESULT_CHARS = 4000;
+function _compactToolCallsForStorage(toolCalls) {
+    return toolCalls.map(tc => {
+        const copy = JSON.parse(JSON.stringify(tc));
+        const s = typeof copy.result === 'string' ? copy.result : (copy.result === undefined ? '' : JSON.stringify(copy.result));
+        if (s.length > STORED_TOOL_RESULT_CHARS) copy.result = `${s.slice(0, STORED_TOOL_RESULT_CHARS)}\n… (${(s.length - STORED_TOOL_RESULT_CHARS).toLocaleString()} more characters not saved)`;
+        return copy;
+    });
+}
+
 export async function runGenerate(session, userText, addUserMsg = true, processedAtts = null) {
     if (state.generating) return;
     state.generating = true;
@@ -820,13 +832,17 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
     let streamAccumText = '';
     let streamAccumReasoning = null;
 
+    const liveRender = createRenderThrottle();
+    let lastReasoningMs = null;
     const cleanupCursor = () => {
+        liveRender.flush();
         if (cursorEl && cursorEl.parentNode) cursorEl.remove();
         cursorEl = null;
     };
 
     const onChunk = (text, reasoning, reasoningMs, reasoningDone) => {
         isStreaming = true;
+        if (reasoningMs) lastReasoningMs = reasoningMs;
         streamAccumText = text;
         streamAccumReasoning = reasoning;
 
@@ -862,6 +878,10 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
             }
         }
 
+        liveRender.schedule(() => renderStreamChunk(text, reasoning, reasoningMs, reasoningDone));
+    };
+
+    const renderStreamChunk = (text, reasoning, reasoningMs, reasoningDone) => {
         if (streamContentEl) {
             let procReasoning = reasoning || '';
             let procText = stripMemoryBlock(text);
@@ -886,7 +906,7 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
             }
 
             streamContentEl.innerHTML = renderMarkdown(procText);
-            if (procText) streamContentEl.appendChild(cursorEl);
+            if (procText && cursorEl) streamContentEl.appendChild(cursorEl);
             postProcessHTMLBlocks(streamContentEl);
 
             if (state.activeToolCalls.length || tcIndex > 0) {
@@ -933,6 +953,7 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
         let result = await callGenerate(session, settings, null, onChunk);
 
         cleanupCursor();
+        let hitMaxTokens = !!result?.isMaxTokens;
         
         if (result && !result.text.trim() && !result.reasoning?.trim()) {
             toastr.warning('⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: 10000 });
@@ -1024,7 +1045,11 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
                     return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
                 }).join("\n");
 
-                extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\nCONTINUE your response using these results. Write exactly where you left off.` });
+                const lastRound = round === maxRounds - 1;
+                const nextStep = lastRound
+                    ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
+                    : 'CONTINUE your response using these results. Write exactly where you left off.';
+                extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
 
                 const thinkingText = document.getElementById('scp-thinking-text');
                 if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
@@ -1046,14 +1071,18 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
                 };
 
                 const nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
-                    _updateLiveUI(t, r);
-                    if (streamContentEl) streamContentEl.appendChild(cursor2);
+                    liveRender.schedule(() => {
+                        _updateLiveUI(t, r);
+                        if (streamContentEl) streamContentEl.appendChild(cursor2);
+                    });
                 });
+                liveRender.flush();
 
                 session.messages = session.messages.filter(m => !m._tcTemp);
                 cursor2.remove();
 
                 if (nextResult === null) break;
+                hitMaxTokens = !!nextResult.isMaxTokens;
 
                 roundText = nextResult.text || '';
                 roundReasoning = nextResult.reasoning || null;
@@ -1092,12 +1121,18 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
             if (msg) { 
                 msg.content = fullText; 
                 msg.reasoning = fullReasoning || null; 
-                msg.toolCalls = state.activeToolCalls.length ? JSON.parse(JSON.stringify(state.activeToolCalls)) : undefined; 
+                msg.toolCalls = state.activeToolCalls.length ? _compactToolCallsForStorage(state.activeToolCalls) : undefined; 
             }
             saveSessionsToMetadata();
 
             if (msg && streamMsgEl) {
                 _renderMsgBodyContent(streamMsgEl, msg);
+                // The "thinking finished" signal never arrives when a reply has no text (e.g. it
+                // was cut off while thinking), so settle the label here.
+                const summaryEl = streamMsgEl.querySelector('.scp-reasoning-summary');
+                if (summaryEl && fullReasoning && /…$/.test(summaryEl.textContent)) {
+                    summaryEl.textContent = lastReasoningMs ? `Thought for ${(lastReasoningMs / 1000).toFixed(1)}s` : 'Thoughts';
+                }
             }
 
             if (msg) {
@@ -1115,6 +1150,19 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
 
         _refreshSwipeBars(session);
         state.activeToolCalls = [];
+
+        // A reply that thought but wrote nothing almost always ran out of Max Tokens while
+        // thinking. When streaming, SillyTavern does not pass the finish reason on, so this
+        // outcome is the reliable signal.
+        const thoughtButNoAnswer = !fullText.trim() && !!fullReasoning?.trim();
+        if (hitMaxTokens || thoughtButNoAnswer) {
+            const limit = parseInt(settings.maxTokens) || 8200;
+            const why = thoughtButNoAnswer
+                ? `The model stopped after thinking, before writing an answer. This usually means its thinking used up the Max Tokens limit (${limit}).`
+                : `The reply was cut off at the Max Tokens limit (${limit}).`;
+            toastr.warning(`${why} Raise Max Tokens in Copilot settings, or lower the model's reasoning effort.`, EXT_DISPLAY, { timeOut: 20000 });
+            _dbgAdd('GEN_MAX_TOKENS', { limit, chars: fullText.length, hasReasoning: !!fullReasoning, finishReasonSeen: hitMaxTokens });
+        }
 
         if (tokensIn > 0) recordStat(SM.tokIn, tokensIn);
         const tokensOut = await estimateTokens(fullText);
@@ -1176,7 +1224,9 @@ export async function runContinue(session, targetMsgId) {
     const targetEl = document.querySelector(`.scp-msg[data-id="${targetMsgId}"]`);
     if (targetEl) streamContentEl = targetEl.querySelector('.scp-msg-content');
 
+    const liveRender = createRenderThrottle();
     const cleanupCursor = () => {
+        liveRender.flush();
         if (cursorEl && cursorEl.parentNode) cursorEl.remove();
         cursorEl = null;
     };
@@ -1190,6 +1240,10 @@ export async function runContinue(session, targetMsgId) {
             const bar = document.getElementById('scp-thinking-bar');
             if (bar) bar.style.display = 'flex';
         }
+        liveRender.schedule(() => renderContinueChunk(text));
+    };
+
+    const renderContinueChunk = (text) => {
         const combined = _joinContinuation(originalContent, text);
         let tcIndex = 0;
         const resC = extractToolCallPlaceholders(combined, tcIndex);
@@ -1198,7 +1252,7 @@ export async function runContinue(session, targetMsgId) {
         const { content: disp } = getDisplayContent(procText, settings);
         if (streamContentEl) {
             streamContentEl.innerHTML = renderMarkdown(disp);
-            streamContentEl.appendChild(cursorEl);
+            if (cursorEl) streamContentEl.appendChild(cursorEl);
             postProcessHTMLBlocks(streamContentEl);
 
             if (resC.nextIndex > 0) {

@@ -4,6 +4,17 @@ import { _dbgAdd } from '../utils/util-debug.js';
 import { getSettings, saveSettings } from '../session.js';
 import { openSettingsPanel } from '../ui/ui-settings.js';
 
+// Results can be huge (read_preset returns whole prompts). The panel only shows a small
+// scrolling box, so cap what goes into the DOM.
+const TOOL_RESULT_DISPLAY_CHARS = 4000;
+
+function _toolResultText(result) {
+    const s = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    return s.length > TOOL_RESULT_DISPLAY_CHARS
+        ? `${s.slice(0, TOOL_RESULT_DISPLAY_CHARS)}\n… (${(s.length - TOOL_RESULT_DISPLAY_CHARS).toLocaleString()} more characters)`
+        : s;
+}
+
 export function createToolCallEl(tc) {
     const item = document.createElement('div');
     item.className = 'scp-tool-call-item scp-inline-tool-call';
@@ -30,7 +41,7 @@ export function createToolCallEl(tc) {
 <div class="scp-tool-call-body">
 <div class="scp-tool-call-section-label">Input</div>
 <pre class="scp-tool-call-args">${escHtml(JSON.stringify(tc.input, null, 2))}</pre>
-${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="margin-top:8px">Result</div><pre class="scp-tool-call-result${tc.status === 'error' ? ' error-result' : ''}" ${isWarning ? `style="${colorStyle}"` : ''}>${escHtml(typeof tc.result === 'string' ? tc.result : JSON.stringify(tc.result, null, 2))}</pre>` : ''}
+${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="margin-top:8px">Result</div><pre class="scp-tool-call-result${tc.status === 'error' ? ' error-result' : ''}" ${isWarning ? `style="${colorStyle}"` : ''}>${escHtml(_toolResultText(tc.result))}</pre>` : ''}
 </div>`;
     item.querySelector('.scp-tool-call-header').addEventListener('click', () => {
         const isOpen = !item.classList.contains('open');
