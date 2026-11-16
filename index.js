@@ -7337,6 +7337,984 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
     stripChatChangesBlock: stripChatChangesBlock
   });
 
+  // Editing of SillyTavern Chat Completion presets attached to a Copilot message.
+  //
+  // The model never sees or rewrites the raw preset file. It gets a readable outline of the
+  // session's working copy (settings, prompts in prompt-manager order with their real on/off
+  // state, regex script names) and proposes edits as a `preset-changes` block of small
+  // operations. The extension applies the accepted operations to its own copy, so everything
+  // the model did not touch is preserved exactly, and serializes the result for download.
+  //
+  // Everything in this module is pure (no DOM), so it runs under the Node test harness.
+
+
+  // ─── Verbatim regions ────────────────────────────────────────────────────────
+  // Attached files and preset text must reach the model exactly as written. Copilot expands
+  // {{outlet::...}} over the assembled prompt, so verbatim text is wrapped in these private-use
+  // sentinels, skipped by the expansion, and the sentinels are removed before sending.
+
+  const VERBATIM_OPEN = '';
+  const VERBATIM_CLOSE = '';
+
+  function protectVerbatim(text) {
+      if (typeof text !== 'string' || !text) return text;
+      return VERBATIM_OPEN + text + VERBATIM_CLOSE;
+  }
+
+  function stripVerbatimMarkers(text) {
+      if (typeof text !== 'string') return text;
+      return text.split(VERBATIM_OPEN).join('').split(VERBATIM_CLOSE).join('');
+  }
+
+  // Runs `transform` on the text outside verbatim regions only, then drops the markers.
+  async function transformOutsideVerbatim(text, transform) {
+      if (typeof text !== 'string' || !text) return text;
+      if (!text.includes(VERBATIM_OPEN)) return stripVerbatimMarkers(await transform(text));
+      const re = new RegExp(`${VERBATIM_OPEN}[\\s\\S]*?${VERBATIM_CLOSE}`, 'g');
+      let out = '';
+      let last = 0;
+      for (const m of text.matchAll(re)) {
+          out += await transform(text.slice(last, m.index));
+          out += m[0].slice(1, -1);
+          last = m.index + m[0].length;
+      }
+      out += await transform(text.slice(last));
+      return stripVerbatimMarkers(out);
+  }
+
+  // ─── Detection and serialization ─────────────────────────────────────────────
+
+  // Prompts SillyTavern's prompt manager expects to exist; they can be toggled or moved but not deleted.
+  const CORE_PROMPT_IDS = [
+      'main', 'nsfw', 'jailbreak', 'enhanceDefinitions', 'worldInfoBefore', 'worldInfoAfter',
+      'charDescription', 'charPersonality', 'scenario', 'personaDescription', 'dialogueExamples', 'chatHistory',
+  ];
+
+  const REGEX_PLACEMENT = { 1: 'user_input', 2: 'ai_output', 3: 'slash_command', 5: 'world_info', 6: 'reasoning' };
+  const REGEX_PLACEMENT_REV = Object.fromEntries(Object.entries(REGEX_PLACEMENT).map(([k, v]) => [v, Number(k)]));
+
+  function isChatCompletionPresetData(data) {
+      return !!data && typeof data === 'object' && !Array.isArray(data)
+          && Array.isArray(data.prompts) && Array.isArray(data.prompt_order);
+  }
+
+  // Returns the parsed preset plus enough formatting info to write it back the same way,
+  // or null if the text is not a Chat Completion preset.
+  function detectChatCompletionPreset(text) {
+      if (typeof text !== 'string' || !text.trim().startsWith('{')) return null;
+      let data;
+      try { data = JSON.parse(text.replace(/^﻿/, '')); } catch (_) { return null; }
+      if (!isChatCompletionPresetData(data)) return null;
+      return { data, format: detectJsonFormat(text) };
+  }
+
+  function detectJsonFormat(text) {
+      const indentMatch = text.match(/^﻿?\{\r?\n([ \t]+)\S/);
+      return {
+          indent: indentMatch ? indentMatch[1] : (text.includes('\n') ? 4 : 0),
+          eol: text.includes('\r\n') ? '\r\n' : '\n',
+          trailingNewline: /\n$/.test(text),
+          bom: text.startsWith('﻿'),
+      };
+  }
+
+  function serializePreset(data, format = {}) {
+      const indent = format.indent ?? 4;
+      let out = JSON.stringify(data, null, indent);
+      if (format.eol === '\r\n') out = out.replace(/\n/g, '\r\n');
+      if (format.trailingNewline) out += format.eol || '\n';
+      if (format.bom) out = '﻿' + out;
+      return out;
+  }
+
+  function editedFileName(fileName) {
+      const name = String(fileName || 'preset.json');
+      const m = name.match(/^(.*?)(\.json)?$/i);
+      let base = m[1] || 'preset';
+      if (!/ \(edited\)$/.test(base)) base += ' (edited)';
+      return `${base}.json`;
+  }
+
+  // ─── Session storage ─────────────────────────────────────────────────────────
+  // One working copy per Copilot session, stored once (not per message). Each accepted
+  // proposal bumps the version; downloads always use the latest version.
+
+  function getSessionPreset(session) {
+      const p = session?.preset;
+      return p && isChatCompletionPresetData(p.data) ? p : null;
+  }
+
+  function setSessionPreset(session, { fileName, data, format }) {
+      session.preset = { fileName, data, format, version: 1, attachedAt: Date.now() };
+      return session.preset;
+  }
+
+  // ─── Model-facing outline ────────────────────────────────────────────────────
+
+  // Prompt text is shown in full when the whole preset's prompt text fits in this many
+  // characters (~10k tokens); otherwise every prompt shows a short preview and the model reads
+  // full text with the read_preset tool.
+  const PRESET_INLINE_CHAR_BUDGET = 40000;
+  const PREVIEW_CHARS = 160;
+
+  function escAttr(v) {
+      return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // The prompt_order list SillyTavern actually uses: 100001 is the global list.
+  function getPrimaryOrder(data) {
+      const lists = Array.isArray(data?.prompt_order) ? data.prompt_order : [];
+      return lists.find(o => String(o?.character_id) === '100001')
+          || lists.find(o => String(o?.character_id) === '100000')
+          || lists[0] || null;
+  }
+
+  function promptPositionAttrs(p) {
+      if (p.marker) return '';
+      const pos = Number(p.injection_position) === 1 ? 'in_chat' : 'relative';
+      let s = ` position="${pos}"`;
+      if (pos === 'in_chat') s += ` depth="${escAttr(p.injection_depth ?? 4)}" order="${escAttr(p.injection_order ?? 100)}"`;
+      return s;
+  }
+
+  function formatScalar(v) {
+      return typeof v === 'string' ? JSON.stringify(v) : String(v);
+  }
+
+  function buildPresetContextBlock(preset) {
+      if (!preset || !isChatCompletionPresetData(preset.data)) return '';
+      const data = preset.data;
+      const prompts = data.prompts;
+      const byId = new Map(prompts.map(p => [p.identifier, p]));
+      const order = getPrimaryOrder(data);
+      const orderEntries = Array.isArray(order?.order) ? order.order : [];
+      const totalChars = prompts.reduce((n, p) => n + (typeof p.content === 'string' ? p.content.length : 0), 0);
+      const inline = totalChars <= PRESET_INLINE_CHAR_BUDGET;
+
+      const lines = [];
+      lines.push(`<attached_preset file="${escAttr(preset.fileName)}" type="chat_completion" version="${preset.version || 1}">`);
+      lines.push(`This is the working copy of the preset file the Human attached for editing. All text is shown exactly as stored; macros such as {{user}}, {{outlet::...}} or {{#if .x}} are NOT expanded.`);
+      if (!inline) lines.push(`The preset is large, so prompt contents below are abbreviated previews. Call read_preset to get the exact full text of any prompt before editing or quoting it.`);
+
+      const scalars = Object.entries(data).filter(([, v]) => v === null || typeof v !== 'object');
+      lines.push('<settings>');
+      for (const [k, v] of scalars) lines.push(`${k}: ${formatScalar(v)}`);
+      lines.push('</settings>');
+
+      const renderPrompt = (p, enabled) => {
+          let attrs = `id="${escAttr(p.identifier)}" name="${escAttr(p.name || '')}"`;
+          if (p.marker) attrs += ` marker="true"`;
+          else attrs += ` role="${escAttr(p.role || 'system')}"`;
+          if (enabled !== undefined) attrs += ` enabled="${enabled ? 'true' : 'false'}"`;
+          attrs += promptPositionAttrs(p);
+          const content = typeof p.content === 'string' ? p.content : '';
+          if (p.marker && content.trim()) attrs += ` unsent_text_chars="${content.length}"`;
+          if (p.marker || !content) return `<prompt ${attrs}/>`;
+          if (inline) return `<prompt ${attrs}>\n${content}\n</prompt>`;
+          const preview = content.length > PREVIEW_CHARS ? content.slice(0, PREVIEW_CHARS).replace(/\s+\S*$/, '') + ' …' : content;
+          return `<prompt ${attrs} chars="${content.length}" preview="true">\n${preview}\n</prompt>`;
+      };
+
+      const seen = new Set();
+      const enabledCount = orderEntries.filter(e => e?.enabled && byId.has(e.identifier)).length;
+      lines.push(`<prompt_order count="${orderEntries.length}" enabled="${enabledCount}">`);
+      lines.push(`Prompts in the order they are sent. "enabled" is the real on/off switch.`);
+      for (const e of orderEntries) {
+          const p = byId.get(e?.identifier);
+          if (!p) continue;
+          seen.add(p.identifier);
+          lines.push(renderPrompt(p, !!e.enabled));
+      }
+      lines.push('</prompt_order>');
+
+      const unordered = prompts.filter(p => !seen.has(p.identifier));
+      if (unordered.length) {
+          lines.push(`<unused_prompts count="${unordered.length}">`);
+          lines.push('Defined in the preset but not in the prompt order, so never sent. Add one to the order with move_prompt.');
+          for (const p of unordered) lines.push(renderPrompt(p, undefined));
+          lines.push('</unused_prompts>');
+      }
+
+      const regex = Array.isArray(data.extensions?.regex_scripts) ? data.extensions.regex_scripts : null;
+      if (regex) {
+          lines.push(`<regex_scripts count="${regex.length}">`);
+          lines.push('Bundled regex scripts. Call read_preset with their names (or ids) to see find/replace patterns.');
+          const nameCount = new Map();
+          for (const r of regex) nameCount.set(r.scriptName, (nameCount.get(r.scriptName) || 0) + 1);
+          for (const r of regex) {
+              const places = (Array.isArray(r.placement) ? r.placement : []).map(n => REGEX_PLACEMENT[n] || n).join(',');
+              let flags = '';
+              if (r.disabled) flags += ' disabled="true"';
+              if (r.promptOnly) flags += ' prompt_only="true"';
+              if (r.markdownOnly) flags += ' display_only="true"';
+              const idAttr = r.scriptName && nameCount.get(r.scriptName) === 1 ? '' : `id="${escAttr(r.id)}" `;
+              lines.push(`<regex ${idAttr}name="${escAttr(r.scriptName || '')}" placement="${escAttr(places)}"${flags}/>`);
+          }
+          lines.push('</regex_scripts>');
+      }
+
+      const otherKeys = Object.entries(data)
+          .filter(([k, v]) => v !== null && typeof v === 'object' && k !== 'prompts' && k !== 'prompt_order')
+          .flatMap(([k, v]) => k === 'extensions' && v && !Array.isArray(v)
+              ? Object.keys(v).filter(x => x !== 'regex_scripts').map(x => `extensions.${x}`)
+              : [k]);
+      if (otherKeys.length) lines.push(`Other data (kept unchanged, not editable here): ${otherKeys.join(', ')}`);
+
+      lines.push('</attached_preset>');
+      return protectVerbatim(`\n\n${lines.join('\n')}`);
+  }
+
+  const PRESET_CHANGES_FORMAT = `\`\`\`preset-changes
+<edit_prompt id="IDENTIFIER">
+<<<<<<< ANCHOR
+exact text copied from the prompt
+=======
+replacement text
+>>>>>>> REPLACE
+</edit_prompt>
+<edit_prompt id="IDENTIFIER" enabled="false"/>
+<edit_prompt id="IDENTIFIER" name="New name" role="user" position="in_chat" depth="2" order="100"/>
+<add_prompt name="Prompt name" role="system" enabled="true" after="OTHER_ID">
+full prompt text
+</add_prompt>
+<move_prompt id="IDENTIFIER" before="OTHER_ID"/>
+<delete_prompt id="IDENTIFIER"/>
+<set_setting key="temperature" value="0.9"/>
+<set_setting key="impersonation_prompt">
+full new text for a text setting
+</set_setting>
+<edit_regex name="Script name" disabled="true"/>
+<edit_regex name="Script name"><find>/new pattern/g</find><replace>new replacement</replace></edit_regex>
+<add_regex name="Script name" placement="ai_output"><find>/pattern/g</find><replace>replacement</replace></add_regex>
+<delete_regex name="Script name"/>
+\`\`\``;
+
+  function buildPresetEditAIInstructions(preset) {
+      if (!preset) return '';
+      return `<preset_editing>
+<context>
+The Human attached a SillyTavern Chat Completion preset ("${escAttr(preset.fileName)}", working copy version ${preset.version || 1}). Its outline is in <attached_preset>. You can edit it; the Human reviews your changes, and the accepted result is offered to them as a downloadable .json file. Each accepted round becomes the new working copy that later edits build on.
+If an <active_preset> block is also present, it describes the preset currently active in SillyTavern with macros expanded; it may be a different preset and is not what you edit here.
+</context>
+
+<how_it_works>
+Never output the whole preset or raw preset JSON. End your reply with one \`preset-changes\` block of small operations; the extension applies them to the file and keeps everything else exactly as it was. Briefly explain the changes in plain text before the block. After the Human decides, the block is removed from the history, so do not repeat earlier blocks.
+</how_it_works>
+
+<rules>
+- Refer to prompts by their id attribute exactly as shown in the outline.
+- Before editing text, make sure you have the exact current text: if the outline only shows a preview, call read_preset first.
+- edit_prompt with a body changes text. Use one or more ANCHOR/REPLACE patches; each ANCHOR must be copied exactly from the current text and appear only once in that prompt (include more surrounding text if needed). For long passages you may write "first few words || last few words". A body without ANCHOR markers replaces the whole prompt text.
+- edit_prompt attributes change settings: enabled, name, role (system/user/assistant), position (relative or in_chat) with depth and order. A self-closing edit_prompt changes only those attributes.
+- Turning a prompt on or off only needs enabled="true|false"; never rewrite its text for that.
+- add_prompt: give after="ID" or before="ID" for its place in the order (default: end). move_prompt reorders an existing prompt the same way.
+- Marker prompts (marker="true", e.g. chatHistory, charDescription, section headers) are placeholders whose text is never sent (unsent_text_chars shows stored text SillyTavern ignores); they can be toggled, renamed or moved but their text cannot be edited. Core prompts (${CORE_PROMPT_IDS.join(', ')}) cannot be deleted.
+- set_setting changes a top-level setting from the <settings> list; the value keeps the setting's current type.
+- Regex scripts are referred to by exact name (or id when shown). <find> and <replace> replace those fields entirely.
+</rules>
+
+<macros>
+Preset text uses SillyTavern macros that are expanded only when the preset runs. Keep them exactly as written, including spacing and braces, unless the Human asks to change them:
+- {{user}}, {{char}}, {{persona}}, {{description}}, {{scenario}} and similar insert values; {{outlet::Name}} inserts lorebook entries assigned to that outlet.
+- {{// text}} is a comment that is removed; {{trim}} removes surrounding blank lines.
+- {{setvar::name::value}}, {{getvar::name}}, {{.name = value}} and {{.name}} set and read variables.
+- {{#if condition}} ... {{else}} ... {{/if}} is conditional text; every {{#if}} needs its {{/if}}. Moving or deleting text must never leave an {{#if}} without its {{/if}} or the reverse.
+When adding text, follow the conventions this preset already uses.
+</macros>
+
+<format>
+${PRESET_CHANGES_FORMAT}
+</format>
+</preset_editing>`;
+  }
+
+  // ─── Reading (read_preset tool) ──────────────────────────────────────────────
+
+  function findPrompt(data, ref) {
+      if (ref === undefined || ref === null || ref === '') return null;
+      const s = String(ref).trim();
+      const prompts = data?.prompts || [];
+      const byId = prompts.find(p => p.identifier === s);
+      if (byId) return byId;
+      const byName = prompts.filter(p => (p.name || '').trim() === s);
+      if (byName.length === 1) return byName[0];
+      const ci = prompts.filter(p => (p.name || '').trim().toLowerCase() === s.toLowerCase());
+      return ci.length === 1 ? ci[0] : null;
+  }
+
+  function findRegex(data, ref) {
+      if (ref === undefined || ref === null || ref === '') return null;
+      const s = String(ref).trim();
+      const list = data?.extensions?.regex_scripts || [];
+      const byId = list.find(r => r.id === s);
+      if (byId) return byId;
+      const byName = list.filter(r => (r.scriptName || '').trim() === s);
+      if (byName.length === 1) return byName[0];
+      const ci = list.filter(r => (r.scriptName || '').trim().toLowerCase() === s.toLowerCase());
+      return ci.length === 1 ? ci[0] : null;
+  }
+
+  const toList = v => (Array.isArray(v) ? v : (v === undefined || v === null || v === '' ? [] : [v]));
+
+  function readPresetItems(preset, input = {}) {
+      if (!preset) return 'No preset is attached in this Copilot session.';
+      const data = preset.data;
+      const out = [];
+      const promptRefs = [...toList(input.prompts), ...toList(input.prompt), ...toList(input.ids)];
+      const regexRefs = [...toList(input.regex), ...toList(input.regex_scripts)];
+      for (const ref of promptRefs) {
+          const p = findPrompt(data, ref);
+          if (!p) { out.push(`<error>No prompt with id or name "${escAttr(ref)}".</error>`); continue; }
+          const content = typeof p.content === 'string' ? p.content : '';
+          out.push(`<prompt id="${escAttr(p.identifier)}" name="${escAttr(p.name || '')}" chars="${content.length}">\n${content}\n</prompt>`);
+      }
+      for (const ref of regexRefs) {
+          const r = findRegex(data, ref);
+          if (!r) { out.push(`<error>No regex script with id or name "${escAttr(ref)}".</error>`); continue; }
+          const places = (r.placement || []).map(n => REGEX_PLACEMENT[n] || n).join(',');
+          out.push(`<regex id="${escAttr(r.id)}" name="${escAttr(r.scriptName || '')}" placement="${places}" disabled="${!!r.disabled}">\n<find>${r.findRegex ?? ''}</find>\n<replace>${r.replaceString ?? ''}</replace>\n</regex>`);
+      }
+      if (!out.length) return 'Pass "prompts" (ids or names) and/or "regex" (ids or names) to read.';
+      return out.join('\n\n');
+  }
+
+  // ─── Parsing ─────────────────────────────────────────────────────────────────
+
+  const OPS = ['edit_prompt', 'add_prompt', 'move_prompt', 'delete_prompt', 'set_setting', 'edit_regex', 'add_regex', 'delete_regex'];
+
+  function decodeEntities(s) {
+      return String(s).replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  }
+
+  function parseAttrs(str) {
+      const attrs = {};
+      const re = /([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+      let m;
+      while ((m = re.exec(str)) !== null) attrs[m[1].toLowerCase()] = decodeEntities(m[2] ?? m[3] ?? '');
+      return attrs;
+  }
+
+  // Drop the newline right after the opening tag and right before the closing tag; keep the rest.
+  function trimBody(body) {
+      return body.replace(/^[ \t]*\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
+  }
+
+  function extractBlock(text) {
+      if (typeof text !== 'string') return null;
+      const strict = text.match(/```preset-changes[^\S\r\n]*\r?\n?([\s\S]*?)```(?!\w)/);
+      if (strict) return strict[1];
+      const open = text.match(/```preset-changes[^\S\r\n]*\r?\n?([\s\S]*)$/);
+      return open ? open[1] : null;
+  }
+
+  function childTag(body, tag) {
+      const m = body.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
+      return m ? m[1] : undefined;
+  }
+
+  function parsePresetChangesFromText(text) {
+      const block = extractBlock(text);
+      if (!block) return null;
+      const changes = [];
+      const tagRe = new RegExp(`<(${OPS.join('|')})\\b([^>]*?)(\\/?)>`, 'gi');
+      let m;
+      while ((m = tagRe.exec(block)) !== null) {
+          const op = m[1].toLowerCase();
+          const attrs = parseAttrs(m[2]);
+          let body;
+          if (!m[3]) {
+              const closeRe = new RegExp(`</${op}\\s*>`, 'i');
+              const rest = block.slice(tagRe.lastIndex);
+              const close = rest.match(closeRe);
+              if (!close) break; // truncated block: drop the incomplete operation
+              body = rest.slice(0, close.index);
+              tagRe.lastIndex += close.index + close[0].length;
+          }
+          const change = { op, ...attrs };
+          if (body !== undefined) {
+              if (op === 'edit_regex' || op === 'add_regex') {
+                  const find = childTag(body, 'find');
+                  const replace = childTag(body, 'replace');
+                  if (find !== undefined) change.find = find;
+                  if (replace !== undefined) change.replace = replace;
+              } else if (/<{5,}[ \t]*(?:SEARCH|ANCHOR)/.test(body) && op === 'edit_prompt') {
+                  change.patches = parseAnchorPatches(body);
+              } else {
+                  change.content = trimBody(body);
+              }
+          }
+          changes.push(change);
+      }
+      return changes.length ? changes : null;
+  }
+
+  function stripPresetChangesBlock(text) {
+      if (typeof text !== 'string') return text;
+      return text.replace(/```preset-changes[\s\S]*?```(?!\w)/g, '').replace(/```preset-changes[\s\S]*$/g, '').trim();
+  }
+
+  // ─── Applying ────────────────────────────────────────────────────────────────
+
+  function countOccurrences(hay, needle) {
+      if (!needle) return 0;
+      let n = 0, i = 0;
+      while ((i = hay.indexOf(needle, i)) !== -1) { n++; i += needle.length; }
+      return n;
+  }
+
+  // Finds `needle` in `hay` ignoring differences in runs of whitespace. Returns [start, end] in hay.
+  function findWhitespaceInsensitive(hay, needle) {
+      const parts = needle.trim().split(/\s+/).filter(Boolean).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      if (!parts.length) return null;
+      const re = new RegExp(parts.join('\\s+'), 'g');
+      const matches = [...hay.matchAll(re)];
+      if (matches.length !== 1) return matches.length ? { ambiguous: matches.length } : null;
+      return { start: matches[0].index, end: matches[0].index + matches[0][0].length };
+  }
+
+  function locate(src, needle) {
+      const exact = countOccurrences(src, needle);
+      if (exact === 1) { const i = src.indexOf(needle); return { start: i, end: i + needle.length }; }
+      if (exact > 1) return { ambiguous: exact };
+      return findWhitespaceInsensitive(src, needle);
+  }
+
+  // Applies one ANCHOR/REPLACE patch. Exact (or whitespace-insensitive) unique matches only;
+  // a fuzzy fallback is allowed but reported so the Human can check the diff.
+  function applyPresetPatch(src, search, replace) {
+      const s = (search || '').trim();
+      if (!s) return { error: 'Empty ANCHOR' };
+      const sep = s.indexOf('||');
+      if (sep > 0 && s.length - sep - 2 > 0) {
+          const head = s.slice(0, sep).trim();
+          const tail = s.slice(sep + 2).trim();
+          const a = locate(src, head);
+          if (a?.ambiguous) return { error: `ANCHOR start "${head.slice(0, 40)}" appears ${a.ambiguous} times; include more text` };
+          if (a) {
+              const rest = src.slice(a.end);
+              const b = locate(rest, tail);
+              if (b && !b.ambiguous) return { result: src.slice(0, a.start) + replace + src.slice(a.end + b.end) };
+              if (b?.ambiguous) {
+                  const i = rest.indexOf(tail);
+                  if (i !== -1) return { result: src.slice(0, a.start) + replace + src.slice(a.end + i + tail.length) };
+              }
+          }
+      } else {
+          const loc = locate(src, s);
+          if (loc?.ambiguous) return { error: `ANCHOR "${s.slice(0, 40)}" appears ${loc.ambiguous} times; include more text` };
+          if (loc) return { result: src.slice(0, loc.start) + replace + src.slice(loc.end) };
+      }
+      const fuzzy = applySearchReplaceToField(src, s, replace);
+      if (fuzzy.matched && fuzzy.result !== src) return { result: fuzzy.result, fuzzy: true };
+      return { error: `ANCHOR not found: "${s.slice(0, 60)}"` };
+  }
+
+  const parseBool = v => (v === undefined ? undefined : /^(true|1|yes|on)$/i.test(String(v).trim()));
+
+  function parseIntAttr(v) {
+      if (v === undefined || v === '') return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.trunc(n) : NaN;
+  }
+
+  function genPromptId(data) {
+      const used = new Set((data.prompts || []).map(p => p.identifier));
+      let id;
+      do {
+          id = (globalThis.crypto?.randomUUID?.() || `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`);
+      } while (used.has(id));
+      return id;
+  }
+
+  function insertIntoOrder(list, entry, change) {
+      const ref = change.after ?? change.before;
+      const idx = ref !== undefined ? list.findIndex(e => e.identifier === ref) : -1;
+      if (idx === -1) list.push(entry);
+      else list.splice(change.after !== undefined ? idx + 1 : idx, 0, entry);
+  }
+
+  // Resolves after/before references (which may be names) to identifiers.
+  function resolvePlacement(data, change) {
+      const out = {};
+      for (const k of ['after', 'before']) {
+          if (change[k] === undefined) continue;
+          const p = findPrompt(data, change[k]);
+          if (!p) return { error: `No prompt "${change[k]}" for ${k}=` };
+          out[k] = p.identifier;
+      }
+      return out;
+  }
+
+  function applyPromptAttrs(p, c, data) {
+      if (c.name !== undefined) p.name = c.name;
+      if (c.role !== undefined) {
+          const role = c.role.toLowerCase();
+          if (!['system', 'user', 'assistant'].includes(role)) throw new Error(`Invalid role "${c.role}"`);
+          p.role = role;
+      }
+      const pos = c.position ?? c.injection_position;
+      if (pos !== undefined) {
+          const v = /^(1|in_chat|in-chat|absolute|depth)$/i.test(pos) ? 1 : /^(0|relative)$/i.test(pos) ? 0 : null;
+          if (v === null) throw new Error(`Invalid position "${pos}"`);
+          p.injection_position = v;
+      }
+      for (const [attr, key] of [['depth', 'injection_depth'], ['injection_depth', 'injection_depth'], ['order', 'injection_order'], ['injection_order', 'injection_order']]) {
+          if (c[attr] === undefined) continue;
+          const n = parseIntAttr(c[attr]);
+          if (Number.isNaN(n) || n < 0) throw new Error(`Invalid ${attr} "${c[attr]}"`);
+          p[key] = n;
+      }
+      if (c.enabled !== undefined) {
+          const en = parseBool(c.enabled);
+          const lists = data.prompt_order || [];
+          let found = false;
+          for (const o of lists) for (const e of (o.order || [])) if (e.identifier === p.identifier) { e.enabled = en; found = true; }
+          if (!found) for (const o of lists) if (Array.isArray(o.order)) o.order.push({ identifier: p.identifier, enabled: en });
+      }
+  }
+
+  function coerceSetting(oldVal, raw, key) {
+      if (typeof oldVal === 'number') {
+          const n = Number(String(raw).trim());
+          if (!Number.isFinite(n)) throw new Error(`"${key}" must be a number`);
+          return n;
+      }
+      if (typeof oldVal === 'boolean') {
+          if (!/^(true|false)$/i.test(String(raw).trim())) throw new Error(`"${key}" must be true or false`);
+          return /^true$/i.test(String(raw).trim());
+      }
+      if (oldVal === null) {
+          try { return JSON.parse(raw); } catch (_) { return raw; }
+      }
+      return String(raw);
+  }
+
+  function parsePlacement(v) {
+      const out = [];
+      for (const part of String(v || 'ai_output').split(/[,\s]+/).filter(Boolean)) {
+          const n = REGEX_PLACEMENT_REV[part.toLowerCase()] ?? (Number.isFinite(Number(part)) ? Number(part) : null);
+          if (n === null) throw new Error(`Unknown placement "${part}"`);
+          out.push(n);
+      }
+      return out;
+  }
+
+  // Applies one change to `data` in place. Returns { label, before?, after?, warning? } or throws.
+  function applyOne(data, c) {
+      const promptLabel = p => `"${p.name || p.identifier}"`;
+      switch (c.op) {
+          case 'edit_prompt': {
+              const p = findPrompt(data, c.id ?? c.name);
+              if (!p) throw new Error(`No prompt with id "${c.id ?? c.name}"`);
+              const before = typeof p.content === 'string' ? p.content : '';
+              let after = before;
+              let warning;
+              if (c.patches?.length || c.content !== undefined) {
+                  if (p.marker) throw new Error(`${promptLabel(p)} is a marker and has no text`);
+                  if (c.patches?.length) {
+                      for (const patch of c.patches) {
+                          const r = applyPresetPatch(after, patch.search, patch.replace);
+                          if (r.error) throw new Error(r.error);
+                          if (r.fuzzy) warning = 'Approximate ANCHOR match; check the diff';
+                          after = r.result;
+                      }
+                  } else after = c.content;
+                  p.content = after;
+              }
+              const attrCopy = { ...c };
+              if (c.id === undefined) delete attrCopy.name; // name was used to find the prompt
+              applyPromptAttrs(p, attrCopy, data);
+              return { label: `Prompt ${promptLabel(p)}: ${promptEditSummary(c)}`, before, after, warning, textChanged: before !== after };
+          }
+          case 'add_prompt': {
+              if (c.content === undefined || !c.content.trim()) throw new Error('add_prompt needs text');
+              const placement = resolvePlacement(data, c);
+              if (placement.error) throw new Error(placement.error);
+              let id = c.id && !findPrompt(data, c.id) ? c.id : genPromptId(data);
+              const p = {
+                  identifier: id, system_prompt: false, enabled: false, marker: false,
+                  name: c.name || 'New Prompt', role: 'system', content: c.content,
+                  injection_position: 0, injection_depth: 4, injection_order: 100, injection_trigger: [], forbid_overrides: false,
+              };
+              applyPromptAttrs(p, { ...c, enabled: undefined }, data);
+              data.prompts.push(p);
+              const enabled = c.enabled === undefined ? true : parseBool(c.enabled);
+              for (const o of data.prompt_order) if (Array.isArray(o.order)) insertIntoOrder(o.order, { identifier: id, enabled }, placement);
+              return { label: `Add prompt "${p.name}"`, before: '', after: p.content, textChanged: true };
+          }
+          case 'move_prompt': {
+              const p = findPrompt(data, c.id ?? c.name);
+              if (!p) throw new Error(`No prompt with id "${c.id ?? c.name}"`);
+              const placement = resolvePlacement(data, c);
+              if (placement.error) throw new Error(placement.error);
+              if (placement.after === undefined && placement.before === undefined) throw new Error('move_prompt needs after= or before=');
+              if (placement.after === p.identifier || placement.before === p.identifier) throw new Error('Cannot move a prompt relative to itself');
+              for (const o of data.prompt_order) {
+                  if (!Array.isArray(o.order)) continue;
+                  const i = o.order.findIndex(e => e.identifier === p.identifier);
+                  const entry = i === -1 ? { identifier: p.identifier, enabled: true } : o.order.splice(i, 1)[0];
+                  insertIntoOrder(o.order, entry, placement);
+              }
+              const where = placement.after !== undefined ? `after "${findPrompt(data, placement.after)?.name || placement.after}"` : `before "${findPrompt(data, placement.before)?.name || placement.before}"`;
+              return { label: `Move prompt ${promptLabel(p)} ${where}` };
+          }
+          case 'delete_prompt': {
+              const p = findPrompt(data, c.id ?? c.name);
+              if (!p) throw new Error(`No prompt with id "${c.id ?? c.name}"`);
+              if (CORE_PROMPT_IDS.includes(p.identifier)) throw new Error(`${promptLabel(p)} is a core prompt and cannot be deleted (disable it instead)`);
+              data.prompts.splice(data.prompts.indexOf(p), 1);
+              for (const o of data.prompt_order) if (Array.isArray(o.order)) o.order = o.order.filter(e => e.identifier !== p.identifier);
+              return { label: `Delete prompt ${promptLabel(p)}`, before: p.content || '', after: '', textChanged: !!p.content };
+          }
+          case 'set_setting': {
+              const key = c.key;
+              if (!key || !(key in data)) throw new Error(`Unknown setting "${key}"`);
+              const old = data[key];
+              if (old !== null && typeof old === 'object') throw new Error(`"${key}" is not a simple setting`);
+              const raw = c.value !== undefined ? c.value : c.content;
+              if (raw === undefined) throw new Error(`No value for "${key}"`);
+              data[key] = coerceSetting(old, raw, key);
+              const isText = typeof old === 'string';
+              return {
+                  label: `Set ${key}${isText ? '' : `: ${formatScalar(old)} → ${formatScalar(data[key])}`}`,
+                  before: isText ? old : undefined, after: isText ? data[key] : undefined, textChanged: isText && old !== data[key],
+              };
+          }
+          case 'edit_regex': {
+              const r = findRegex(data, c.id ?? c.name);
+              if (!r) throw new Error(`No regex script "${c.id ?? c.name}"`);
+              const before = `find: ${r.findRegex ?? ''}\nreplace: ${r.replaceString ?? ''}`;
+              if (c.find !== undefined) r.findRegex = c.find;
+              if (c.replace !== undefined) r.replaceString = c.replace;
+              if (c.new_name !== undefined) r.scriptName = c.new_name;
+              if (c.disabled !== undefined) r.disabled = parseBool(c.disabled);
+              if (c.enabled !== undefined) r.disabled = !parseBool(c.enabled);
+              if (c.placement !== undefined) r.placement = parsePlacement(c.placement);
+              const after = `find: ${r.findRegex ?? ''}\nreplace: ${r.replaceString ?? ''}`;
+              return { label: `Edit regex "${r.scriptName || r.id}"`, before, after, textChanged: before !== after };
+          }
+          case 'add_regex': {
+              if (!c.find) throw new Error('add_regex needs <find>');
+              if (!data.extensions || typeof data.extensions !== 'object') data.extensions = {};
+              if (!Array.isArray(data.extensions.regex_scripts)) data.extensions.regex_scripts = [];
+              const r = {
+                  id: globalThis.crypto?.randomUUID?.() || `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`,
+                  scriptName: c.name || 'New Regex', findRegex: c.find, replaceString: c.replace ?? '', trimStrings: [],
+                  placement: parsePlacement(c.placement), disabled: parseBool(c.disabled) || false,
+                  markdownOnly: parseBool(c.display_only) || false, promptOnly: parseBool(c.prompt_only) || false,
+                  runOnEdit: true, substituteRegex: 0, minDepth: null, maxDepth: null,
+              };
+              data.extensions.regex_scripts.push(r);
+              return { label: `Add regex "${r.scriptName}"`, before: '', after: `find: ${r.findRegex}\nreplace: ${r.replaceString}`, textChanged: true };
+          }
+          case 'delete_regex': {
+              const list = data.extensions?.regex_scripts;
+              const r = findRegex(data, c.id ?? c.name);
+              if (!r) throw new Error(`No regex script "${c.id ?? c.name}"`);
+              list.splice(list.indexOf(r), 1);
+              return { label: `Delete regex "${r.scriptName || r.id}"` };
+          }
+          default:
+              throw new Error(`Unknown operation "${c.op}"`);
+      }
+  }
+
+  // Applies changes in order to a copy of `data`. Failed changes are skipped and reported;
+  // the rest still apply. `data` itself is never modified.
+  function applyPresetChanges(data, changes) {
+      const next = structuredClone(data);
+      const results = [];
+      for (const c of changes || []) {
+          const snapshot = structuredClone(next);
+          try {
+              results.push({ ok: true, ...applyOne(next, c) });
+          } catch (e) {
+              // Roll back partial edits from this change.
+              for (const k of Object.keys(next)) delete next[k];
+              Object.assign(next, snapshot);
+              results.push({ ok: false, label: describePresetChange(c, data), error: e.message });
+          }
+      }
+      return { data: next, results };
+  }
+
+  // "edit text, turn off, change name" for an edit_prompt change.
+  function promptEditSummary(c) {
+      const parts = [];
+      if (c.patches?.length || c.content !== undefined) parts.push('edit text');
+      if (c.enabled !== undefined) parts.push(parseBool(c.enabled) ? 'turn on' : 'turn off');
+      const settings = ['role', 'position', 'injection_position', 'depth', 'injection_depth', 'order', 'injection_order'].filter(k => c[k] !== undefined);
+      if (c.id !== undefined && c.name !== undefined) parts.unshift('rename');
+      if (settings.length) parts.push(`change ${settings.join(', ')}`);
+      return parts.join(', ') || 'no change';
+  }
+
+  function describePresetChange(c, data) {
+      const name = ref => {
+          const p = data && findPrompt(data, ref);
+          return `"${p?.name || ref}"`;
+      };
+      switch (c.op) {
+          case 'edit_prompt': return `Prompt ${name(c.id ?? c.name)}: ${promptEditSummary(c)}`;
+          case 'add_prompt': return `Add prompt "${c.name || 'New Prompt'}"`;
+          case 'move_prompt': return `Move prompt ${name(c.id ?? c.name)}`;
+          case 'delete_prompt': return `Delete prompt ${name(c.id ?? c.name)}`;
+          case 'set_setting': return `Set ${c.key}`;
+          case 'edit_regex': return `Edit regex "${c.id ?? c.name}"`;
+          case 'add_regex': return `Add regex "${c.name || 'New Regex'}"`;
+          case 'delete_regex': return `Delete regex "${c.id ?? c.name}"`;
+          default: return c.op;
+      }
+  }
+
+  // Sanity checks on a result before it is offered for download.
+  function validatePresetData(data) {
+      const problems = [];
+      if (!isChatCompletionPresetData(data)) return ['Not a Chat Completion preset'];
+      const ids = new Set();
+      for (const p of data.prompts) {
+          if (!p.identifier) problems.push('A prompt has no identifier');
+          else if (ids.has(p.identifier)) problems.push(`Duplicate prompt id "${p.identifier}"`);
+          ids.add(p.identifier);
+      }
+      for (const o of data.prompt_order) {
+          for (const e of (o.order || [])) if (!ids.has(e.identifier)) problems.push(`prompt_order refers to missing prompt "${e.identifier}"`);
+      }
+      try { JSON.parse(JSON.stringify(data)); } catch (_) { problems.push('Not serializable'); }
+      return problems;
+  }
+
+  // Proposal card for `preset-changes` blocks and the download of the edited preset.
+
+
+  const SLIDERS = '<i class="fa-solid fa-sliders"></i>';
+
+  function downloadSessionPreset(session = getCurrentSession()) {
+      const preset = getSessionPreset(session);
+      if (!preset) { toastr.warning('No preset is attached in this Copilot session.', EXT_DISPLAY); return; }
+      const text = serializePreset(preset.data, preset.format);
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = editedFileName(preset.fileName);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function logPresetEditHistory(lines, afterMsgId) {
+      if (!lines.length) return;
+      try {
+          if (afterMsgId && addHistoryToSwipe(afterMsgId, lines)) return;
+          const histText = `**System Notification** — Preset edits:\n${lines.join('\n')}`;
+          const msg = addMessage(getCurrentSession(), 'system', histText, { isLBHistory: true, isPresetEditHistory: true, appliedLines: [...lines] });
+          appendLBHistoryEl(msg);
+      } catch (_) {}
+  }
+
+  function stripBlockFromMessage(msgId, extra = {}) {
+      const session = getCurrentSession();
+      const msg = session.messages.find(m => m.id === msgId);
+      if (!msg) return null;
+      msg.content = stripPresetChangesBlock(msg.content);
+      if (msg.swipes) msg.swipes[msg.swipeIndex || 0].content = msg.content;
+      Object.assign(msg, extra);
+      saveSessionsToMetadata();
+      return msg;
+  }
+
+  function insertCard(card, msgEl) {
+      const body = msgEl.querySelector('.scp-msg-body');
+      if (body) body.insertBefore(card, body.querySelector('.scp-swipe-bar'));
+      else msgEl.after(card);
+  }
+
+  function renderPresetProposalCard(changes, msgEl) {
+      if (!changes?.length) return;
+      const msgId = msgEl.dataset.id;
+      document.querySelector(`.scp-preset-proposal-card[data-for="${msgId}"]`)?.remove();
+
+      const preset = getSessionPreset(getCurrentSession());
+      const included = changes.map(() => true);
+
+      const card = document.createElement('div');
+      card.className = 'scp-lb-proposal-card scp-preset-proposal-card';
+      card.dataset.for = msgId;
+      card.style.margin = '8px 0 0 0';
+
+      const header = document.createElement('div');
+      header.className = 'scp-lb-proposal-header';
+      const headerLeft = document.createElement('div');
+      headerLeft.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1;min-width:0';
+      headerLeft.innerHTML = `<span class="scp-lb-proposal-icon" style="color:var(--scp-accent);display:flex">${SLIDERS}</span>`
+          + `<span class="scp-lb-proposal-title">Proposed Preset Edits</span>`;
+      const countBadge = document.createElement('span');
+      countBadge.className = 'scp-lb-proposal-count';
+      headerLeft.appendChild(countBadge);
+      const dismissBtn = document.createElement('button');
+      dismissBtn.className = 'scp-lb-proposal-dismiss'; dismissBtn.innerHTML = I.x; dismissBtn.title = 'Reject all';
+      header.appendChild(headerLeft); header.appendChild(dismissBtn);
+
+      const fileRow = document.createElement('div');
+      fileRow.style.cssText = 'font-size:11px;opacity:.75;padding:4px 10px 0';
+      fileRow.textContent = preset
+          ? `${preset.fileName} · working copy v${preset.version || 1} → v${(preset.version || 1) + 1}`
+          : 'No preset is attached in this Copilot session. Attach the preset again to apply these edits.';
+
+      const list = document.createElement('div');
+      list.className = 'scp-lb-proposal-list';
+
+      const footer = document.createElement('div');
+      footer.className = 'scp-lb-proposal-footer';
+      const applyBtn = document.createElement('button');
+      applyBtn.className = 'scp-lb-proposal-apply';
+      applyBtn.textContent = 'Apply & Download';
+      const rejectBtn = document.createElement('button');
+      rejectBtn.className = 'scp-lb-proposal-reject'; rejectBtn.textContent = 'Reject All';
+      footer.appendChild(applyBtn); footer.appendChild(rejectBtn);
+
+      // Simulates the included changes, in order, against the current working copy.
+      const simulate = () => {
+          const current = getSessionPreset(getCurrentSession());
+          if (!current) return null;
+          const chosen = changes.filter((_, i) => included[i]);
+          const { data, results } = applyPresetChanges(current.data, chosen);
+          const perChange = [];
+          let k = 0;
+          changes.forEach((_, i) => { perChange[i] = included[i] ? results[k++] : null; });
+          return { data, perChange };
+      };
+
+      const renderItems = () => {
+          const sim = simulate();
+          list.innerHTML = '';
+          let okCount = 0;
+          changes.forEach((c, i) => {
+              const r = sim?.perChange[i];
+              const item = document.createElement('div');
+              const isDelete = /^delete_/.test(c.op);
+              item.className = `scp-lb-proposal-item ${isDelete ? 'scp-lb-proposal-delete' : c.op.startsWith('add_') ? 'scp-lb-proposal-add' : 'scp-lb-proposal-edit'}`;
+              if (!included[i]) item.classList.add('scp-lb-item-rejected');
+              const hdr = document.createElement('div');
+              hdr.className = 'scp-lb-proposal-item-header';
+
+              const meta = document.createElement('div');
+              meta.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1;flex-wrap:wrap;min-width:0';
+              const cb = document.createElement('input');
+              cb.type = 'checkbox'; cb.checked = included[i]; cb.title = 'Include this change';
+              cb.addEventListener('change', () => { included[i] = cb.checked; renderItems(); });
+              const label = document.createElement('span');
+              label.className = 'scp-lb-proposal-name';
+              label.textContent = r?.label || c.op;
+              meta.appendChild(cb); meta.appendChild(label);
+
+              if (r && !r.ok) {
+                  const warn = document.createElement('div');
+                  warn.style.cssText = 'font-size:10px;color:var(--scp-danger);width:100%';
+                  warn.textContent = `⚠ ${r.error} — will be skipped`;
+                  meta.appendChild(warn);
+                  item.style.borderLeftColor = 'var(--scp-danger)';
+              } else if (r?.warning) {
+                  const warn = document.createElement('div');
+                  warn.style.cssText = 'font-size:10px;color:var(--scp-warning, #ffb432);width:100%';
+                  warn.textContent = `⚠ ${r.warning}`;
+                  meta.appendChild(warn);
+              }
+              if (r?.ok) okCount++;
+
+              const btns = document.createElement('div');
+              btns.className = 'scp-lb-proposal-item-btns';
+              if (r?.ok && r.textChanged) {
+                  const diffBtn = document.createElement('button');
+                  diffBtn.className = 'scp-lb-proposal-diff-btn'; diffBtn.title = 'View diff'; diffBtn.innerHTML = I.diff;
+                  diffBtn.addEventListener('click', e => { e.stopPropagation(); openTextDiffModal(r.label, r.before || '', r.after || ''); });
+                  btns.appendChild(diffBtn);
+              }
+              hdr.appendChild(meta); hdr.appendChild(btns);
+              item.appendChild(hdr);
+              list.appendChild(item);
+          });
+          const n = included.filter(Boolean).length;
+          countBadge.textContent = `${n}/${changes.length} selected`;
+          applyBtn.disabled = !sim || okCount === 0;
+          applyBtn.title = !sim ? 'No preset attached in this session' : okCount === 0 ? 'Nothing that can be applied is selected' : '';
+      };
+
+      const rejectAll = () => {
+          const data = getSessionPreset(getCurrentSession())?.data;
+          logPresetEditHistory(changes.map(c => `✕ **REJECTED**: preset change ${describePresetChange(c, data)}`), msgId);
+          stripBlockFromMessage(msgId);
+          card.remove();
+      };
+
+      dismissBtn.addEventListener('click', rejectAll);
+      rejectBtn.addEventListener('click', rejectAll);
+
+      applyBtn.addEventListener('click', () => {
+          const session = getCurrentSession();
+          const current = getSessionPreset(session);
+          const sim = simulate();
+          if (!current || !sim) return;
+          const problems = validatePresetData(sim.data);
+          if (problems.length) {
+              toastr.error(`The edited preset failed validation: ${problems.slice(0, 3).join('; ')}`, EXT_DISPLAY, { timeOut: 10000 });
+              return;
+          }
+          const newVersion = (current.version || 1) + 1;
+          const lines = [];
+          changes.forEach((c, i) => {
+              const r = sim.perChange[i];
+              if (!included[i]) lines.push(`✕ **REJECTED**: preset change ${describePresetChange(c, current.data)}`);
+              else if (!r.ok) lines.push(`✕ **REJECTED**: preset change could not be applied: ${r.label} (${r.error})`);
+              else lines.push(`✓ **ACCEPTED**: preset v${newVersion}: ${r.label}`);
+          });
+          current.data = sim.data;
+          current.version = newVersion;
+          saveSessionsToMetadata();
+          downloadSessionPreset(session);
+          logPresetEditHistory(lines, msgId);
+          const msg = stripBlockFromMessage(msgId, { presetResult: { version: newVersion, fileName: current.fileName } });
+          card.remove();
+          if (msg) _renderMsgBodyContent(msgEl, msg);
+          toastr.success(`Preset updated to v${newVersion} and downloaded.`, EXT_DISPLAY);
+      });
+
+      card.appendChild(header);
+      card.appendChild(fileRow);
+      card.appendChild(list);
+      card.appendChild(footer);
+      renderItems();
+      insertCard(card, msgEl);
+      bringWindowToFront();
+  }
+
+  // Shown on a message whose preset edits were applied: re-download the latest working copy.
+  function renderPresetResultCard(msg, msgEl) {
+      document.querySelector(`.scp-preset-result-card[data-for="${msg.id}"]`)?.remove();
+      const preset = getSessionPreset(getCurrentSession());
+      if (!msg.presetResult || !preset) return;
+      const card = document.createElement('div');
+      card.className = 'scp-lb-proposal-card scp-preset-result-card';
+      card.dataset.for = msg.id;
+      card.style.margin = '8px 0 0 0';
+      const row = document.createElement('div');
+      row.className = 'scp-lb-proposal-header';
+      const left = document.createElement('div');
+      left.style.cssText = 'display:flex;align-items:center;gap:8px;flex:1;min-width:0';
+      left.innerHTML = `<span class="scp-lb-proposal-icon" style="color:var(--scp-accent);display:flex">${SLIDERS}</span>`
+          + `<span class="scp-lb-proposal-title">Preset updated to v${escHtml(msg.presetResult.version)}</span>`;
+      const btn = document.createElement('button');
+      btn.className = 'scp-lb-proposal-apply';
+      btn.textContent = `Download latest (v${preset.version || 1})`;
+      btn.title = editedFileName(preset.fileName);
+      btn.addEventListener('click', () => downloadSessionPreset());
+      row.appendChild(left); row.appendChild(btn);
+      card.appendChild(row);
+      insertCard(card, msgEl);
+  }
+
   function logChatEditHistory(changes, statusStr, afterMsgId = null) {
       if (!changes?.length) return;
       try {
@@ -8571,15 +9549,39 @@ ${scopeHtml}
     updateMemoryDot: updateMemoryDot
   });
 
+  // Always available while the Copilot session has an attached preset, even with tools off:
+  // large presets are only outlined in context, so this is how the model reads exact text.
+  const READ_PRESET_TOOL = {
+      id: 'read_preset',
+      name: 'read_preset',
+      label: 'Read Attached Preset',
+      icon: 'fa-sliders',
+      description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed.',
+      schema: {
+          type: 'object',
+          properties: {
+              prompts: { type: 'array', items: { type: 'string' }, description: 'Prompt ids (or exact names) to read' },
+              regex: { type: 'array', items: { type: 'string' }, description: 'Regex script names (or ids) to read' },
+          },
+      },
+  };
+
+  function _sessionHasPreset() {
+      try { return !!getSessionPreset(getCurrentSession()); } catch (_) { return false; }
+  }
+
   function getEnabledTools() {
       const s = getSettings();
-      if (!s.toolsEnabled) return [];
-      return TOOL_DEFINITIONS.filter(t => s[t.settingKey] !== false);
+      const tools = s.toolsEnabled ? TOOL_DEFINITIONS.filter(t => s[t.settingKey] !== false) : [];
+      if (_sessionHasPreset()) tools.push(READ_PRESET_TOOL);
+      return tools;
   }
 
   async function executeTool(toolName, toolInput) {
       const ctx = SillyTavern.getContext();
       switch (toolName) {
+          case 'read_preset':
+              return readPresetItems(getSessionPreset(getCurrentSession()), toolInput || {});
           case 'search_chat': {
               const msgs = ctx.chat || [];
               let rawQueries = Array.isArray(toolInput.queries) ? toolInput.queries : (Array.isArray(toolInput.query) ? toolInput.query : [toolInput.query || '']);
@@ -10378,7 +11380,7 @@ ${scopeHtml}
       const item = document.createElement('div');
       item.className = 'scp-tool-call-item scp-inline-tool-call';
       item.dataset.toolId = tc.id;
-      const def = TOOL_DEFINITIONS.find(d => d.name === tc.name);
+      const def = TOOL_DEFINITIONS.find(d => d.name === tc.name) || (tc.name === 'read_preset' ? { icon: 'fa-sliders' } : null);
       const iconClass = def?.icon || 'fa-screwdriver-wrench';
       
       const isWarning = tc.status === 'warning';
@@ -10613,7 +11615,18 @@ ${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="mar
               if (!text && a.file) {
                   try { text = await a.file.text(); } catch(e) { text = '(binary data or read error)'; }
               }
-              processed.push({ ...a, sendAsText: true, textContent: text });
+              const preset = /\.json$/i.test(a.name || '') || /json/i.test(a.type || '') ? detectChatCompletionPreset(text) : null;
+              if (preset) {
+                  // The raw file is never sent. The model gets an outline of the session's working
+                  // copy in the system prompt and edits it through preset-changes operations.
+                  processed.push({
+                      ...a, isPreset: true, sendAsText: true,
+                      textContent: `[Attached SillyTavern Chat Completion preset "${a.name}". It is loaded as this session's working copy and outlined in <attached_preset>; edit it with a preset-changes block.]`,
+                      presetPayload: { fileName: a.name, data: preset.data, format: preset.format },
+                  });
+                  continue;
+              }
+              processed.push({ ...a, isTextFile: true, sendAsText: true, textContent: text });
           } else {
               processed.push({ ...a });
           }
@@ -10623,7 +11636,10 @@ ${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="mar
 
   function _mergeContent(baseText, atts) {
       if (!atts || !atts.length) return baseText;
-      const textParts = atts.filter(a => a.textContent).map(a => a.sendAsText ? a.textContent : `[Attached file "${a.name}"]\n${a.textContent}`);
+      // Attachment text is wrapped as verbatim so macro/outlet expansion never touches it.
+      const textParts = atts.filter(a => a.textContent).map(a => protectVerbatim(
+          a.isTextFile || !a.sendAsText ? `[Attached file "${a.name}"]\n${a.textContent}\n[End of attached file "${a.name}"]` : a.textContent
+      ));
       const textPrefix = textParts.join('\n\n');
       
       let combinedText = '';
@@ -11228,7 +12244,8 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const charChanges = parseCharChangesFromText(msg.content);
           const charCreation = parseCharCreationFromText(msg.content);
           const chatChanges = parseChatChangesFromText(msg.content);
-          const needsStrip = lbChanges?.length || charChanges?.length || charCreation || chatChanges?.length;
+          const presetChanges = msg.role === 'assistant' ? parsePresetChangesFromText(msg.content) : null;
+          const needsStrip = lbChanges?.length || charChanges?.length || charCreation || chatChanges?.length || presetChanges?.length;
 
           if (needsStrip) {
               let stripped = displayText;
@@ -11236,6 +12253,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               if (charChanges?.length) stripped = stripCharChangesBlock(stripped);
               if (charCreation) stripped = stripCharCreationBlock(stripped);
               if (chatChanges?.length) stripped = stripChatChangesBlock(stripped);
+              if (presetChanges?.length) stripped = stripPresetChangesBlock(stripped);
               
               contentEl.innerHTML = renderMarkdown(getDisplayContent(stripped, settings).content);
               postProcessHTMLBlocks(contentEl);
@@ -11244,11 +12262,14 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               if (charChanges?.length) renderCharProposalCard(charChanges, msgEl);
               if (charCreation) renderCharCreationCard(charCreation, msgEl);
               if (chatChanges?.length) renderChatProposalCard(chatChanges, msgEl);
+              if (presetChanges?.length) renderPresetProposalCard(presetChanges, msgEl);
           } else {
               contentEl.innerHTML = renderMarkdown(getDisplayContent(displayText, settings).content);
               postProcessHTMLBlocks(contentEl);
           }
       }
+
+      if (msg.presetResult) renderPresetResultCard(msg, msgEl);
 
       const currentSwipe = msg.swipes?.[msg.swipeIndex || 0];
       if (currentSwipe?.historyLines?.length) {
@@ -11839,6 +12860,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const charChanges = parseCharChangesFromText(textToRender);
           const charCreation = parseCharCreationFromText(textToRender);
           const chatChanges = parseChatChangesFromText(textToRender);
+          const presetChanges = msg.role === 'assistant' ? parsePresetChangesFromText(textToRender) : null;
           let stripped = textToRender;
           
           if (lbChanges?.length) { 
@@ -11860,6 +12882,11 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               stripped = stripChatChangesBlock(stripped); 
               renderChatProposalCard(chatChanges, wrapEl); 
           } else document.querySelector(`.scp-chat-proposal-card[data-for="${msg.id}"]`)?.remove();
+
+          if (presetChanges?.length) {
+              stripped = stripPresetChangesBlock(stripped);
+              renderPresetProposalCard(presetChanges, wrapEl);
+          } else document.querySelector(`.scp-preset-proposal-card[data-for="${msg.id}"]`)?.remove();
           
           let tcIndex = 0;
           const resR = extractToolCallPlaceholders(stripped, tcIndex);
@@ -14228,7 +15255,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       return null;
   }
 
-  async function buildSystemContent(settings) {
+  async function buildSystemContent(settings, preset = null) {
       let sysPromptRaw = (typeof settings.systemPrompt === 'string' && settings.systemPrompt.trim()) ? settings.systemPrompt : DEFAULT_SYSTEM_PROMPT;
       const parts = [_ensureWrapped(sysPromptRaw, 'system_prompt')];
       const charInfo = getCharInfo();
@@ -14243,6 +15270,8 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const presetBlock = buildActivePresetBlock();
           if (presetBlock) parts.push(presetBlock);
       }
+
+      if (preset) parts.push(buildPresetContextBlock(preset));
 
       if (ctx.groupId && ctx.groups) {
           const group = ctx.groups.find(g => g.id === ctx.groupId);
@@ -14301,8 +15330,9 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       const chatEditDirective = buildChatEditAIInstructions(settings).trim();
       const memoryAIInstr = buildMemoryAIInstructions(settings).trim();
       const toolsBlock = buildToolCallsSystemBlock().trim();
+      const presetDirective = preset ? buildPresetEditAIInstructions(preset) : '';
 
-      const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, toolsBlock].filter(Boolean);
+      const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
       if (modules.length > 0) {
           const reminder = `\n\n[Reminder: changes are only applied through the structured blocks described above. Describing a change in plain text does not apply it.]`;
           parts.push(`\n\n<modules>\n${modules.join('\n\n')}${reminder}\n</modules>`);
@@ -14326,7 +15356,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               return { status, detail };
           });
 
-          const ctg = msg.isCharEditHistory ? 'character_card_changes' : (msg.isChatEditHistory ? 'chat_messages_edits' : 'lorebook_changes');
+          const ctg = msg.isPresetEditHistory ? 'preset_changes' : msg.isCharEditHistory ? 'character_card_changes' : (msg.isChatEditHistory ? 'chat_messages_edits' : 'lorebook_changes');
           const obj = { type: 'system_notification', category: ctg, entries };
           if (charName) obj.character = charName;
 
@@ -14365,7 +15395,10 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
   }
 
   async function assembleMessages(session, settings, pendingUserText, pendingAtts = null) {
-      const messages = [{ role: 'system', content: await buildSystemContent(settings) }];
+      // A preset in the pending attachments (Raw Context preview) is shown as if already attached.
+      const pendingPreset = pendingAtts?.find(a => a.presetPayload)?.presetPayload;
+      const preset = pendingPreset ? { ...pendingPreset, version: 1 } : getSessionPreset(session);
+      const messages = [{ role: 'system', content: await buildSystemContent(settings, preset) }];
       const depth = Math.max(0, parseInt(settings.contextDepth) || 0);
       const hasPicked = !!(session.pickedChatIndices && session.pickedChatIndices.length > 0);
       
@@ -14441,11 +15474,12 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               if (hasAttachedHistory) {
                   let cat = 'system_action_results';
                   const firstLine = currentSwipe.historyLines[0] || '';
-                  if (firstLine.includes('Character') || firstLine.includes('Tags') || firstLine.includes('Description') || firstLine.includes('Personality')) cat = 'character_card_changes';
+                  if (firstLine.includes('preset')) cat = 'preset_changes';
+                  else if (firstLine.includes('Character') || firstLine.includes('Tags') || firstLine.includes('Description') || firstLine.includes('Personality')) cat = 'character_card_changes';
                   else if (firstLine.includes('message')) cat = 'chat_messages_edits';
                   else cat = 'lorebook_changes';
 
-                  const dummy = { appliedLines: currentSwipe.historyLines, isCharEditHistory: cat === 'character_card_changes', isChatEditHistory: cat === 'chat_messages_edits' };
+                  const dummy = { appliedLines: currentSwipe.historyLines, isCharEditHistory: cat === 'character_card_changes', isChatEditHistory: cat === 'chat_messages_edits', isPresetEditHistory: cat === 'preset_changes' };
                   const historyContext = _buildAiContextForHistoryMsg(dummy);
                   
                   messages.push({ role: 'user', content: historyContext });
@@ -14459,13 +15493,16 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           }
       }
 
+      // Expand {{outlet::...}} in Copilot's own text, but never inside attached files or preset
+      // text, which must reach the model exactly as written.
+      const expand = t => expandOutletsAsync(t);
       for (let m of messages) {
           if (typeof m.content === 'string') {
-              m.content = await expandOutletsAsync(m.content);
+              m.content = await transformOutsideVerbatim(m.content, expand);
           } else if (Array.isArray(m.content)) {
               for (let part of m.content) {
                   if (part.type === 'text') {
-                      part.text = await expandOutletsAsync(part.text);
+                      part.text = await transformOutsideVerbatim(part.text, expand);
                   }
               }
           }
@@ -15096,8 +16133,16 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
 
       try {
           if (addUserMsg && (userText || (processedAtts && processedAtts.length))) {
+              // An attached Chat Completion preset becomes the session's working copy (stored once
+              // on the session, not on the message). A newer attachment replaces the older one.
+              const atts = (processedAtts || []).map(a => {
+                  if (!a.presetPayload) return a;
+                  setSessionPreset(session, a.presetPayload);
+                  const { presetPayload, file, ...rest } = a;
+                  return rest;
+              });
               const msgObj = addMessage(session, 'user', userText, { 
-                  attachments: processedAtts || []
+                  attachments: atts
               });
               appendMsgEl(msgObj);
               recordStat(SM.msg);
@@ -15124,7 +16169,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               toastr.warning('⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: 10000 });
           }
 
-          if (result !== null && settings.toolsEnabled && getEnabledTools().length > 0) {
+          if (result !== null && getEnabledTools().length > 0) {
               const maxRounds = settings.toolsMaxRounds ?? 5;
               let roundText = result.text || '';
               let roundReasoning = result.reasoning;
@@ -15181,6 +16226,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                       _updateLiveUI();
 
                       try {
+                          if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
                           const res = await executeTool(tc.name, tc.input);
                           if (res?.__ask_user) {
                               if (!streamMsgEl) {
@@ -15204,9 +16250,10 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                   }
 
                   extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) });
-                  const toolResultsText = roundEntries.map(e =>
-                      `<tool_result name="${e.name}" status="${e.status}">\n${typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2)}\n</tool_result>`
-                  ).join("\n");
+                  const toolResultsText = roundEntries.map(e => {
+                      const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
+                      return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
+                  }).join("\n");
 
                   extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\nCONTINUE your response using these results. Write exactly where you left off.` });
 

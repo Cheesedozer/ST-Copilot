@@ -22,6 +22,7 @@ Enter **ST-Copilot** — an advanced Out-Of-Character (OOC) meta-assistant, crea
 | **👻 Ghost Mode** | Make the Copilot window semi-transparent and completely click-through so it never gets in your way. |
 | **🎨 Deep Customization** | Built-in theme engine with color pickers, blur effects, and import/export capabilities. |
 | **📂 Advanced Sessions** | Keep multiple separate Copilot conversations per chat, including auto-deleting temporary sessions. |
+| **🎛️ Preset Editor** | Attach a Chat Completion preset (.json) and ask Copilot to change it. Review each change, then download the edited preset. |
 
 ---
 
@@ -111,6 +112,12 @@ A fully integrated, highly detailed theme editor.
 *   Choose from gorgeous presets like *Dark Sky*, *Glass*, *Hacker*, or *Native ST*.
 *   Use the integrated interactive color picker (with alpha/transparency support) to tweak every single background, border, and accent color.
 *   Export your themes to JSON and share them, or import themes from the community.
+
+### 9. Preset Editor
+Attach a Chat Completion preset `.json` with the paperclip and ask for changes, e.g. *"make the Scene Plan shorter and turn off Undercurrents"*.
+*   Copilot sees a readable outline of the preset (settings, prompts in order with their real on/off state, regex script names) instead of the raw file, so even very large presets fit in context. Macros are shown exactly as written, never expanded.
+*   It proposes small, targeted changes. Review them in the proposal card (with diffs), untick any you don't want, then **Apply & Download** saves `<name> (edited).json`.
+*   Everything Copilot didn't change is kept exactly as it was. Later requests build on the latest version, and **Download latest** re-downloads it at any time. Attaching a preset again starts over from that file.
 
 ---
 

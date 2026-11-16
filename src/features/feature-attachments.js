@@ -4,6 +4,7 @@ import { _dbgAdd } from '../utils/util-debug.js';
 import { _getCaptionViaExtension } from '../integrations/integ-captioning.js';
 import { getSettings, getCurrentSession } from '../session.js';
 import { EXT_DISPLAY } from '../constants.js';
+import { detectChatCompletionPreset, protectVerbatim } from './feature-preset-engine.js';
 
 import { updateMsgCount } from '../ui/ui-chat.js';
 
@@ -37,7 +38,18 @@ export async function _processAttachmentsBeforeSend(atts, isPreview = false) {
             if (!text && a.file) {
                 try { text = await a.file.text(); } catch(e) { text = '(binary data or read error)'; }
             }
-            processed.push({ ...a, sendAsText: true, textContent: text });
+            const preset = /\.json$/i.test(a.name || '') || /json/i.test(a.type || '') ? detectChatCompletionPreset(text) : null;
+            if (preset) {
+                // The raw file is never sent. The model gets an outline of the session's working
+                // copy in the system prompt and edits it through preset-changes operations.
+                processed.push({
+                    ...a, isPreset: true, sendAsText: true,
+                    textContent: `[Attached SillyTavern Chat Completion preset "${a.name}". It is loaded as this session's working copy and outlined in <attached_preset>; edit it with a preset-changes block.]`,
+                    presetPayload: { fileName: a.name, data: preset.data, format: preset.format },
+                });
+                continue;
+            }
+            processed.push({ ...a, isTextFile: true, sendAsText: true, textContent: text });
         } else {
             processed.push({ ...a });
         }
@@ -47,7 +59,10 @@ export async function _processAttachmentsBeforeSend(atts, isPreview = false) {
 
 export function _mergeContent(baseText, atts) {
     if (!atts || !atts.length) return baseText;
-    const textParts = atts.filter(a => a.textContent).map(a => a.sendAsText ? a.textContent : `[Attached file "${a.name}"]\n${a.textContent}`);
+    // Attachment text is wrapped as verbatim so macro/outlet expansion never touches it.
+    const textParts = atts.filter(a => a.textContent).map(a => protectVerbatim(
+        a.isTextFile || !a.sendAsText ? `[Attached file "${a.name}"]\n${a.textContent}\n[End of attached file "${a.name}"]` : a.textContent
+    ));
     const textPrefix = textParts.join('\n\n');
     
     let combinedText = '';
@@ -223,4 +238,4 @@ export function _setupAttachButton() {
         };
         inp.click();
     });
-}
+}
