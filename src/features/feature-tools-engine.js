@@ -12,10 +12,12 @@ export const READ_PRESET_TOOL = {
     name: 'read_preset',
     label: 'Read Attached Preset',
     icon: 'fa-sliders',
-    description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed.',
+    description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed. For a whole-preset review, pass {"all": true} once.',
     schema: {
         type: 'object',
         properties: {
+            all: { type: 'boolean', description: 'Return every enabled prompt with text, in order (one call for a whole-preset review)' },
+            include_disabled: { type: 'boolean', description: 'With all: also include disabled prompts' },
             prompts: { type: 'array', items: { type: 'string' }, description: 'Prompt ids (or exact names) to read' },
             regex: { type: 'array', items: { type: 'string' }, description: 'Regex script names (or ids) to read' },
         },

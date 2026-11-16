@@ -1322,6 +1322,33 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
   }
 
+  // Coalesces frequent UI updates (e.g. one per streamed chunk) into at most one run per
+  // `minInterval` ms, always with the latest scheduled function. Re-rendering a whole message
+  // and forcing layout on every chunk makes long streamed replies cost O(n²) and freezes the page.
+  function createRenderThrottle(minInterval = 100) {
+      let pending = null, timer = null, last = 0;
+      const run = () => {
+          timer = null;
+          const fn = pending;
+          pending = null;
+          if (!fn) return;
+          last = Date.now();
+          fn();
+      };
+      return {
+          schedule(fn) {
+              pending = fn;
+              if (timer) return;
+              timer = setTimeout(run, Math.max(0, minInterval - (Date.now() - last)));
+          },
+          // Run a scheduled update now (e.g. when the stream ends), so the last state is shown.
+          flush() {
+              if (timer) clearTimeout(timer);
+              run();
+          },
+      };
+  }
+
   function escHtml(str) {
       return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
@@ -1436,6 +1463,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
     _fileToDataUrl: _fileToDataUrl,
     autoResize: autoResize,
     copyText: copyText,
+    createRenderThrottle: createRenderThrottle,
     escHtml: escHtml,
     fallbackCopy: fallbackCopy,
     showCustomDialog: showCustomDialog
@@ -7604,6 +7632,7 @@ Never output the whole preset or raw preset JSON. End your reply with one \`pres
 <rules>
 - Refer to prompts by their id attribute exactly as shown in the outline.
 - Before editing text, make sure you have the exact current text: if the outline only shows a preview, call read_preset first.
+- To review or analyze the whole preset, call read_preset once with {"all": true} (enabled prompts; add "include_disabled": true for every prompt) instead of reading prompts one by one. Tool rounds are limited.
 - edit_prompt with a body changes text. Use one or more ANCHOR/REPLACE patches; each ANCHOR must be copied exactly from the current text and appear only once in that prompt (include more surrounding text if needed). For long passages you may write "first few words || last few words". A body without ANCHOR markers replaces the whole prompt text.
 - edit_prompt attributes change settings: enabled, name, role (system/user/assistant), position (relative or in_chat) with depth and order. A self-closing edit_prompt changes only those attributes.
 - Turning a prompt on or off only needs enabled="true|false"; never rewrite its text for that.
@@ -7656,9 +7685,41 @@ ${PRESET_CHANGES_FORMAT}
 
   const toList = v => (Array.isArray(v) ? v : (v === undefined || v === null || v === '' ? [] : [v]));
 
+  // Cap for read_preset {"all": true} (~60k tokens); anything beyond is listed so the model can
+  // read it by id in a later call.
+  const PRESET_READ_ALL_CHAR_CAP = 240000;
+
+  function readAllPrompts(data, includeDisabled) {
+      const byId = new Map(data.prompts.map(p => [p.identifier, p]));
+      const order = getPrimaryOrder(data)?.order || [];
+      const picked = [];
+      const seen = new Set();
+      for (const e of order) {
+          const p = byId.get(e?.identifier);
+          if (!p || seen.has(p.identifier)) continue;
+          seen.add(p.identifier);
+          if (p.marker || !(typeof p.content === 'string' && p.content.trim())) continue;
+          if (!e.enabled && !includeDisabled) continue;
+          picked.push({ p, enabled: !!e.enabled });
+      }
+      const out = [];
+      const skipped = [];
+      let used = 0;
+      for (const { p, enabled } of picked) {
+          if (used + p.content.length > PRESET_READ_ALL_CHAR_CAP && out.length) { skipped.push(p); continue; }
+          used += p.content.length;
+          out.push(`<prompt id="${escAttr(p.identifier)}" name="${escAttr(p.name || '')}" role="${escAttr(p.role || 'system')}" enabled="${enabled}" chars="${p.content.length}">\n${p.content}\n</prompt>`);
+      }
+      const scope = includeDisabled ? 'all prompts with text' : 'enabled prompts with text';
+      let head = `${out.length} ${scope}, in prompt order.`;
+      if (skipped.length) head += ` ${skipped.length} more did not fit in one result; read them by id: ${skipped.map(p => p.identifier).join(', ')}`;
+      return [head, ...out].join('\n\n');
+  }
+
   function readPresetItems(preset, input = {}) {
       if (!preset) return 'No preset is attached in this Copilot session.';
       const data = preset.data;
+      if (input.all === true || input.all === 'true') return readAllPrompts(data, input.include_disabled === true || input.include_disabled === 'true');
       const out = [];
       const promptRefs = [...toList(input.prompts), ...toList(input.prompt), ...toList(input.ids)];
       const regexRefs = [...toList(input.regex), ...toList(input.regex_scripts)];
@@ -7674,7 +7735,7 @@ ${PRESET_CHANGES_FORMAT}
           const places = (r.placement || []).map(n => REGEX_PLACEMENT[n] || n).join(',');
           out.push(`<regex id="${escAttr(r.id)}" name="${escAttr(r.scriptName || '')}" placement="${places}" disabled="${!!r.disabled}">\n<find>${r.findRegex ?? ''}</find>\n<replace>${r.replaceString ?? ''}</replace>\n</regex>`);
       }
-      if (!out.length) return 'Pass "prompts" (ids or names) and/or "regex" (ids or names) to read.';
+      if (!out.length) return 'Pass "all": true, "prompts" (ids or names) and/or "regex" (ids or names) to read.';
       return out.join('\n\n');
   }
 
@@ -9556,10 +9617,12 @@ ${scopeHtml}
       name: 'read_preset',
       label: 'Read Attached Preset',
       icon: 'fa-sliders',
-      description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed.',
+      description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed. For a whole-preset review, pass {"all": true} once.',
       schema: {
           type: 'object',
           properties: {
+              all: { type: 'boolean', description: 'Return every enabled prompt with text, in order (one call for a whole-preset review)' },
+              include_disabled: { type: 'boolean', description: 'With all: also include disabled prompts' },
               prompts: { type: 'array', items: { type: 'string' }, description: 'Prompt ids (or exact names) to read' },
               regex: { type: 'array', items: { type: 'string' }, description: 'Regex script names (or ids) to read' },
           },
@@ -11376,6 +11439,17 @@ ${scopeHtml}
     updateSettingsUI: updateSettingsUI
   });
 
+  // Results can be huge (read_preset returns whole prompts). The panel only shows a small
+  // scrolling box, so cap what goes into the DOM.
+  const TOOL_RESULT_DISPLAY_CHARS = 4000;
+
+  function _toolResultText(result) {
+      const s = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      return s.length > TOOL_RESULT_DISPLAY_CHARS
+          ? `${s.slice(0, TOOL_RESULT_DISPLAY_CHARS)}\n… (${(s.length - TOOL_RESULT_DISPLAY_CHARS).toLocaleString()} more characters)`
+          : s;
+  }
+
   function createToolCallEl(tc) {
       const item = document.createElement('div');
       item.className = 'scp-tool-call-item scp-inline-tool-call';
@@ -11402,7 +11476,7 @@ ${scopeHtml}
 <div class="scp-tool-call-body">
 <div class="scp-tool-call-section-label">Input</div>
 <pre class="scp-tool-call-args">${escHtml(JSON.stringify(tc.input, null, 2))}</pre>
-${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="margin-top:8px">Result</div><pre class="scp-tool-call-result${tc.status === 'error' ? ' error-result' : ''}" ${isWarning ? `style="${colorStyle}"` : ''}>${escHtml(typeof tc.result === 'string' ? tc.result : JSON.stringify(tc.result, null, 2))}</pre>` : ''}
+${tc.result !== undefined ? `<div class="scp-tool-call-section-label" style="margin-top:8px">Result</div><pre class="scp-tool-call-result${tc.status === 'error' ? ' error-result' : ''}" ${isWarning ? `style="${colorStyle}"` : ''}>${escHtml(_toolResultText(tc.result))}</pre>` : ''}
 </div>`;
       item.querySelector('.scp-tool-call-header').addEventListener('click', () => {
           const isOpen = !item.classList.contains('open');
@@ -16033,6 +16107,18 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       return { text: text.trim(), reasoning, isMaxTokens };
   }
 
+  // Tool results are only shown in the UI after the turn (they are not resent to the model), so
+  // long ones are trimmed before being saved with the message.
+  const STORED_TOOL_RESULT_CHARS = 4000;
+  function _compactToolCallsForStorage(toolCalls) {
+      return toolCalls.map(tc => {
+          const copy = JSON.parse(JSON.stringify(tc));
+          const s = typeof copy.result === 'string' ? copy.result : (copy.result === undefined ? '' : JSON.stringify(copy.result));
+          if (s.length > STORED_TOOL_RESULT_CHARS) copy.result = `${s.slice(0, STORED_TOOL_RESULT_CHARS)}\n… (${(s.length - STORED_TOOL_RESULT_CHARS).toLocaleString()} more characters not saved)`;
+          return copy;
+      });
+  }
+
   async function runGenerate(session, userText, addUserMsg = true, processedAtts = null) {
       if (state.generating) return;
       state.generating = true;
@@ -16051,13 +16137,17 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       let streamAccumText = '';
       let streamAccumReasoning = null;
 
+      const liveRender = createRenderThrottle();
+      let lastReasoningMs = null;
       const cleanupCursor = () => {
+          liveRender.flush();
           if (cursorEl && cursorEl.parentNode) cursorEl.remove();
           cursorEl = null;
       };
 
       const onChunk = (text, reasoning, reasoningMs, reasoningDone) => {
           isStreaming = true;
+          if (reasoningMs) lastReasoningMs = reasoningMs;
           streamAccumText = text;
           streamAccumReasoning = reasoning;
 
@@ -16093,6 +16183,10 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               }
           }
 
+          liveRender.schedule(() => renderStreamChunk(text, reasoning, reasoningMs, reasoningDone));
+      };
+
+      const renderStreamChunk = (text, reasoning, reasoningMs, reasoningDone) => {
           if (streamContentEl) {
               let procReasoning = reasoning || '';
               let procText = stripMemoryBlock(text);
@@ -16117,7 +16211,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               }
 
               streamContentEl.innerHTML = renderMarkdown(procText);
-              if (procText) streamContentEl.appendChild(cursorEl);
+              if (procText && cursorEl) streamContentEl.appendChild(cursorEl);
               postProcessHTMLBlocks(streamContentEl);
 
               if (state.activeToolCalls.length || tcIndex > 0) {
@@ -16164,6 +16258,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           let result = await callGenerate(session, settings, null, onChunk);
 
           cleanupCursor();
+          let hitMaxTokens = !!result?.isMaxTokens;
           
           if (result && !result.text.trim() && !result.reasoning?.trim()) {
               toastr.warning('⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: 10000 });
@@ -16255,7 +16350,11 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                       return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
                   }).join("\n");
 
-                  extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\nCONTINUE your response using these results. Write exactly where you left off.` });
+                  const lastRound = round === maxRounds - 1;
+                  const nextStep = lastRound
+                      ? 'This was the last tool round: further tool calls will NOT run. Do not call any more tools. Using what you have, write your complete final answer now.'
+                      : 'CONTINUE your response using these results. Write exactly where you left off.';
+                  extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\n${nextStep}` });
 
                   const thinkingText = document.getElementById('scp-thinking-text');
                   if (thinkingText) thinkingText.textContent = `Round ${round + 2}/${maxRounds + 1}…`;
@@ -16277,14 +16376,18 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
                   };
 
                   const nextResult = await callGenerate(tempSession, settings, null, (t, r) => {
-                      _updateLiveUI(t, r);
-                      if (streamContentEl) streamContentEl.appendChild(cursor2);
+                      liveRender.schedule(() => {
+                          _updateLiveUI(t, r);
+                          if (streamContentEl) streamContentEl.appendChild(cursor2);
+                      });
                   });
+                  liveRender.flush();
 
                   session.messages = session.messages.filter(m => !m._tcTemp);
                   cursor2.remove();
 
                   if (nextResult === null) break;
+                  hitMaxTokens = !!nextResult.isMaxTokens;
 
                   roundText = nextResult.text || '';
                   roundReasoning = nextResult.reasoning || null;
@@ -16323,12 +16426,18 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               if (msg) { 
                   msg.content = fullText; 
                   msg.reasoning = fullReasoning || null; 
-                  msg.toolCalls = state.activeToolCalls.length ? JSON.parse(JSON.stringify(state.activeToolCalls)) : undefined; 
+                  msg.toolCalls = state.activeToolCalls.length ? _compactToolCallsForStorage(state.activeToolCalls) : undefined; 
               }
               saveSessionsToMetadata();
 
               if (msg && streamMsgEl) {
                   _renderMsgBodyContent(streamMsgEl, msg);
+                  // The "thinking finished" signal never arrives when a reply has no text (e.g. it
+                  // was cut off while thinking), so settle the label here.
+                  const summaryEl = streamMsgEl.querySelector('.scp-reasoning-summary');
+                  if (summaryEl && fullReasoning && /…$/.test(summaryEl.textContent)) {
+                      summaryEl.textContent = lastReasoningMs ? `Thought for ${(lastReasoningMs / 1000).toFixed(1)}s` : 'Thoughts';
+                  }
               }
 
               if (msg) {
@@ -16346,6 +16455,19 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
 
           _refreshSwipeBars(session);
           state.activeToolCalls = [];
+
+          // A reply that thought but wrote nothing almost always ran out of Max Tokens while
+          // thinking. When streaming, SillyTavern does not pass the finish reason on, so this
+          // outcome is the reliable signal.
+          const thoughtButNoAnswer = !fullText.trim() && !!fullReasoning?.trim();
+          if (hitMaxTokens || thoughtButNoAnswer) {
+              const limit = parseInt(settings.maxTokens) || 8200;
+              const why = thoughtButNoAnswer
+                  ? `The model stopped after thinking, before writing an answer. This usually means its thinking used up the Max Tokens limit (${limit}).`
+                  : `The reply was cut off at the Max Tokens limit (${limit}).`;
+              toastr.warning(`${why} Raise Max Tokens in Copilot settings, or lower the model's reasoning effort.`, EXT_DISPLAY, { timeOut: 20000 });
+              _dbgAdd('GEN_MAX_TOKENS', { limit, chars: fullText.length, hasReasoning: !!fullReasoning, finishReasonSeen: hitMaxTokens });
+          }
 
           if (tokensIn > 0) recordStat(SM.tokIn, tokensIn);
           const tokensOut = await estimateTokens(fullText);
@@ -16407,7 +16529,9 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       const targetEl = document.querySelector(`.scp-msg[data-id="${targetMsgId}"]`);
       if (targetEl) streamContentEl = targetEl.querySelector('.scp-msg-content');
 
+      const liveRender = createRenderThrottle();
       const cleanupCursor = () => {
+          liveRender.flush();
           if (cursorEl && cursorEl.parentNode) cursorEl.remove();
           cursorEl = null;
       };
@@ -16421,6 +16545,10 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
               const bar = document.getElementById('scp-thinking-bar');
               if (bar) bar.style.display = 'flex';
           }
+          liveRender.schedule(() => renderContinueChunk(text));
+      };
+
+      const renderContinueChunk = (text) => {
           const combined = _joinContinuation(originalContent, text);
           let tcIndex = 0;
           const resC = extractToolCallPlaceholders(combined, tcIndex);
@@ -16429,7 +16557,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
           const { content: disp } = getDisplayContent(procText, settings);
           if (streamContentEl) {
               streamContentEl.innerHTML = renderMarkdown(disp);
-              streamContentEl.appendChild(cursorEl);
+              if (cursorEl) streamContentEl.appendChild(cursorEl);
               postProcessHTMLBlocks(streamContentEl);
 
               if (resC.nextIndex > 0) {

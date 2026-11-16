@@ -1,5 +1,32 @@
 import { EXT_DISPLAY } from '../constants.js';
 
+// Coalesces frequent UI updates (e.g. one per streamed chunk) into at most one run per
+// `minInterval` ms, always with the latest scheduled function. Re-rendering a whole message
+// and forcing layout on every chunk makes long streamed replies cost O(n²) and freezes the page.
+export function createRenderThrottle(minInterval = 100) {
+    let pending = null, timer = null, last = 0;
+    const run = () => {
+        timer = null;
+        const fn = pending;
+        pending = null;
+        if (!fn) return;
+        last = Date.now();
+        fn();
+    };
+    return {
+        schedule(fn) {
+            pending = fn;
+            if (timer) return;
+            timer = setTimeout(run, Math.max(0, minInterval - (Date.now() - last)));
+        },
+        // Run a scheduled update now (e.g. when the stream ends), so the last state is shown.
+        flush() {
+            if (timer) clearTimeout(timer);
+            run();
+        },
+    };
+}
+
 export function escHtml(str) {
     return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
