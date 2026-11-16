@@ -12,6 +12,8 @@ import { parseCharChangesFromText, stripCharChangesBlock, parseCharCreationFromT
 import { renderCharProposalCard, renderCharCreationCard } from '../features/feature-character-ui.js';
 import { applySearchReplaceToField } from '../utils/util-text.js';
 import { parseChatChangesFromText, stripChatChangesBlock } from '../features/feature-chatedit-engine.js';
+import { parsePresetChangesFromText, stripPresetChangesBlock } from '../features/feature-preset-engine.js';
+import { renderPresetProposalCard, renderPresetResultCard } from '../features/feature-preset-ui.js';
 import { renderChatProposalCard } from '../features/feature-chatedit-ui.js';
 import { stripMemoryBlock } from '../features/feature-memory.js';
 import { parseToolCallsFromText } from '../features/feature-tools-engine.js';
@@ -434,7 +436,8 @@ export function _renderMsgBodyContent(msgEl, msg) {
         const charChanges = parseCharChangesFromText(msg.content);
         const charCreation = parseCharCreationFromText(msg.content);
         const chatChanges = parseChatChangesFromText(msg.content);
-        const needsStrip = lbChanges?.length || charChanges?.length || charCreation || chatChanges?.length;
+        const presetChanges = msg.role === 'assistant' ? parsePresetChangesFromText(msg.content) : null;
+        const needsStrip = lbChanges?.length || charChanges?.length || charCreation || chatChanges?.length || presetChanges?.length;
 
         if (needsStrip) {
             let stripped = displayText;
@@ -442,6 +445,7 @@ export function _renderMsgBodyContent(msgEl, msg) {
             if (charChanges?.length) stripped = stripCharChangesBlock(stripped);
             if (charCreation) stripped = stripCharCreationBlock(stripped);
             if (chatChanges?.length) stripped = stripChatChangesBlock(stripped);
+            if (presetChanges?.length) stripped = stripPresetChangesBlock(stripped);
             
             contentEl.innerHTML = renderMarkdown(getDisplayContent(stripped, settings).content);
             postProcessHTMLBlocks(contentEl);
@@ -450,11 +454,14 @@ export function _renderMsgBodyContent(msgEl, msg) {
             if (charChanges?.length) renderCharProposalCard(charChanges, msgEl);
             if (charCreation) renderCharCreationCard(charCreation, msgEl);
             if (chatChanges?.length) renderChatProposalCard(chatChanges, msgEl);
+            if (presetChanges?.length) renderPresetProposalCard(presetChanges, msgEl);
         } else {
             contentEl.innerHTML = renderMarkdown(getDisplayContent(displayText, settings).content);
             postProcessHTMLBlocks(contentEl);
         }
     }
+
+    if (msg.presetResult) renderPresetResultCard(msg, msgEl);
 
     const currentSwipe = msg.swipes?.[msg.swipeIndex || 0];
     if (currentSwipe?.historyLines?.length) {
@@ -1045,6 +1052,7 @@ export function handleEdit(wrapEl, msg) {
         const charChanges = parseCharChangesFromText(textToRender);
         const charCreation = parseCharCreationFromText(textToRender);
         const chatChanges = parseChatChangesFromText(textToRender);
+        const presetChanges = msg.role === 'assistant' ? parsePresetChangesFromText(textToRender) : null;
         let stripped = textToRender;
         
         if (lbChanges?.length) { 
@@ -1066,6 +1074,11 @@ export function handleEdit(wrapEl, msg) {
             stripped = stripChatChangesBlock(stripped); 
             renderChatProposalCard(chatChanges, wrapEl); 
         } else document.querySelector(`.scp-chat-proposal-card[data-for="${msg.id}"]`)?.remove();
+
+        if (presetChanges?.length) {
+            stripped = stripPresetChangesBlock(stripped);
+            renderPresetProposalCard(presetChanges, wrapEl);
+        } else document.querySelector(`.scp-preset-proposal-card[data-for="${msg.id}"]`)?.remove();
         
         let tcIndex = 0;
         const resR = extractToolCallPlaceholders(stripped, tcIndex);
@@ -2011,4 +2024,4 @@ export function setupSearchHotkey() {
         else openSearch();
     };
     document.addEventListener('keydown', _searchHotkeyHandler, true);
-}
+}

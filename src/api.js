@@ -17,13 +17,14 @@ import { buildCharacterContextBlock, buildCharEditAIInstructions } from './featu
 import { buildChatEditAIInstructions } from './features/feature-chatedit-engine.js';
 import { buildMemoryContextBlock, buildMemoryAIInstructions, processMemoryUpdates, stripMemoryBlock } from './features/feature-memory.js';
 import { buildToolCallsSystemBlock, parseToolCallsFromText, executeTool, getEnabledTools } from './features/feature-tools-engine.js';
+import { getSessionPreset, setSessionPreset, buildPresetContextBlock, buildPresetEditAIInstructions, protectVerbatim, transformOutsideVerbatim } from './features/feature-preset-engine.js';
 
 import { updateMsgCount, smartScrollToBottom, setGeneratingState, showGenerationError, _renderMsgBodyContent, updateSwipeBar, _refreshSwipeBars, appendMsgEl } from './ui/ui-chat.js';
 import { getDisplayContent, extractToolCallPlaceholders, renderMarkdown, postProcessHTMLBlocks } from './ui/ui-chat.js'; 
 import { postProcessToolCalls, executeAskUser } from './features/feature-tools-ui.js';
 import { playCompletionSound } from './ui/ui-widgets.js';
 
-export async function buildSystemContent(settings) {
+export async function buildSystemContent(settings, preset = null) {
     let sysPromptRaw = (typeof settings.systemPrompt === 'string' && settings.systemPrompt.trim()) ? settings.systemPrompt : DEFAULT_SYSTEM_PROMPT;
     const parts = [_ensureWrapped(sysPromptRaw, 'system_prompt')];
     const charInfo = getCharInfo();
@@ -38,6 +39,8 @@ export async function buildSystemContent(settings) {
         const presetBlock = buildActivePresetBlock();
         if (presetBlock) parts.push(presetBlock);
     }
+
+    if (preset) parts.push(buildPresetContextBlock(preset));
 
     if (ctx.groupId && ctx.groups) {
         const group = ctx.groups.find(g => g.id === ctx.groupId);
@@ -96,8 +99,9 @@ export async function buildSystemContent(settings) {
     const chatEditDirective = buildChatEditAIInstructions(settings).trim();
     const memoryAIInstr = buildMemoryAIInstructions(settings).trim();
     const toolsBlock = buildToolCallsSystemBlock().trim();
+    const presetDirective = preset ? buildPresetEditAIInstructions(preset) : '';
 
-    const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, toolsBlock].filter(Boolean);
+    const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
     if (modules.length > 0) {
         const reminder = `\n\n[Reminder: changes are only applied through the structured blocks described above. Describing a change in plain text does not apply it.]`;
         parts.push(`\n\n<modules>\n${modules.join('\n\n')}${reminder}\n</modules>`);
@@ -121,7 +125,7 @@ export function _buildAiContextForHistoryMsg(msg) {
             return { status, detail };
         });
 
-        const ctg = msg.isCharEditHistory ? 'character_card_changes' : (msg.isChatEditHistory ? 'chat_messages_edits' : 'lorebook_changes');
+        const ctg = msg.isPresetEditHistory ? 'preset_changes' : msg.isCharEditHistory ? 'character_card_changes' : (msg.isChatEditHistory ? 'chat_messages_edits' : 'lorebook_changes');
         const obj = { type: 'system_notification', category: ctg, entries };
         if (charName) obj.character = charName;
 
@@ -160,7 +164,10 @@ export function getMainChatSlice(depth) {
 }
 
 export async function assembleMessages(session, settings, pendingUserText, pendingAtts = null) {
-    const messages = [{ role: 'system', content: await buildSystemContent(settings) }];
+    // A preset in the pending attachments (Raw Context preview) is shown as if already attached.
+    const pendingPreset = pendingAtts?.find(a => a.presetPayload)?.presetPayload;
+    const preset = pendingPreset ? { ...pendingPreset, version: 1 } : getSessionPreset(session);
+    const messages = [{ role: 'system', content: await buildSystemContent(settings, preset) }];
     const depth = Math.max(0, parseInt(settings.contextDepth) || 0);
     const hasPicked = !!(session.pickedChatIndices && session.pickedChatIndices.length > 0);
     
@@ -236,11 +243,12 @@ export async function assembleMessages(session, settings, pendingUserText, pendi
             if (hasAttachedHistory) {
                 let cat = 'system_action_results';
                 const firstLine = currentSwipe.historyLines[0] || '';
-                if (firstLine.includes('Character') || firstLine.includes('Tags') || firstLine.includes('Description') || firstLine.includes('Personality')) cat = 'character_card_changes';
+                if (firstLine.includes('preset')) cat = 'preset_changes';
+                else if (firstLine.includes('Character') || firstLine.includes('Tags') || firstLine.includes('Description') || firstLine.includes('Personality')) cat = 'character_card_changes';
                 else if (firstLine.includes('message')) cat = 'chat_messages_edits';
                 else cat = 'lorebook_changes';
 
-                const dummy = { appliedLines: currentSwipe.historyLines, isCharEditHistory: cat === 'character_card_changes', isChatEditHistory: cat === 'chat_messages_edits' };
+                const dummy = { appliedLines: currentSwipe.historyLines, isCharEditHistory: cat === 'character_card_changes', isChatEditHistory: cat === 'chat_messages_edits', isPresetEditHistory: cat === 'preset_changes' };
                 const historyContext = _buildAiContextForHistoryMsg(dummy);
                 
                 messages.push({ role: 'user', content: historyContext });
@@ -254,13 +262,16 @@ export async function assembleMessages(session, settings, pendingUserText, pendi
         }
     }
 
+    // Expand {{outlet::...}} in Copilot's own text, but never inside attached files or preset
+    // text, which must reach the model exactly as written.
+    const expand = t => expandOutletsAsync(t);
     for (let m of messages) {
         if (typeof m.content === 'string') {
-            m.content = await expandOutletsAsync(m.content);
+            m.content = await transformOutsideVerbatim(m.content, expand);
         } else if (Array.isArray(m.content)) {
             for (let part of m.content) {
                 if (part.type === 'text') {
-                    part.text = await expandOutletsAsync(part.text);
+                    part.text = await transformOutsideVerbatim(part.text, expand);
                 }
             }
         }
@@ -891,8 +902,16 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
 
     try {
         if (addUserMsg && (userText || (processedAtts && processedAtts.length))) {
+            // An attached Chat Completion preset becomes the session's working copy (stored once
+            // on the session, not on the message). A newer attachment replaces the older one.
+            const atts = (processedAtts || []).map(a => {
+                if (!a.presetPayload) return a;
+                setSessionPreset(session, a.presetPayload);
+                const { presetPayload, file, ...rest } = a;
+                return rest;
+            });
             const msgObj = addMessage(session, 'user', userText, { 
-                attachments: processedAtts || []
+                attachments: atts
             });
             appendMsgEl(msgObj);
             recordStat(SM.msg);
@@ -919,7 +938,7 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
             toastr.warning('⚠ Generation failed: AI returned an empty response.', EXT_DISPLAY, { timeOut: 10000 });
         }
 
-        if (result !== null && settings.toolsEnabled && getEnabledTools().length > 0) {
+        if (result !== null && getEnabledTools().length > 0) {
             const maxRounds = settings.toolsMaxRounds ?? 5;
             let roundText = result.text || '';
             let roundReasoning = result.reasoning;
@@ -976,6 +995,7 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
                     _updateLiveUI();
 
                     try {
+                        if (!getEnabledTools().some(t => t.name === tc.name)) throw new Error(`Tool "${tc.name}" is not available.`);
                         const res = await executeTool(tc.name, tc.input);
                         if (res?.__ask_user) {
                             if (!streamMsgEl) {
@@ -999,9 +1019,10 @@ export async function runGenerate(session, userText, addUserMsg = true, processe
                 }
 
                 extraHistory.push({ role: 'assistant', content: stripMemoryBlock(roundText) });
-                const toolResultsText = roundEntries.map(e =>
-                    `<tool_result name="${e.name}" status="${e.status}">\n${typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2)}\n</tool_result>`
-                ).join("\n");
+                const toolResultsText = roundEntries.map(e => {
+                    const body = typeof e.result === 'string' ? e.result : JSON.stringify(e.result, null, 2);
+                    return `<tool_result name="${e.name}" status="${e.status}">\n${e.name === 'read_preset' ? protectVerbatim(body) : body}\n</tool_result>`;
+                }).join("\n");
 
                 extraHistory.push({ role: 'user', content: `<tool_results>\n${toolResultsText}\n</tool_results>\n\nCONTINUE your response using these results. Write exactly where you left off.` });
 

@@ -1,13 +1,36 @@
 import { DEFAULT_TOOLS_PROMPT, TOOL_CALL_FORMAT_BLOCK, TOOL_DEFINITIONS } from '../constants.js';
-import { getSettings } from '../session.js';
+import { getSettings, getCurrentSession } from '../session.js';
+import { getSessionPreset, readPresetItems } from './feature-preset-engine.js';
 import { _ensureWrapped } from '../utils/util-text.js';
 import { getCharInfo, getTagsForCharacter } from '../utils/util-st.js';
 import { fetchWorldInfoBook, getDisplayName, getActiveLorebookNames, wiEntriesToArray } from './feature-lorebook-engine.js';
 
+// Always available while the Copilot session has an attached preset, even with tools off:
+// large presets are only outlined in context, so this is how the model reads exact text.
+export const READ_PRESET_TOOL = {
+    id: 'read_preset',
+    name: 'read_preset',
+    label: 'Read Attached Preset',
+    icon: 'fa-sliders',
+    description: 'Return the exact full text of prompts and/or regex scripts from the preset attached in this session. Use before editing a prompt whose text is only previewed.',
+    schema: {
+        type: 'object',
+        properties: {
+            prompts: { type: 'array', items: { type: 'string' }, description: 'Prompt ids (or exact names) to read' },
+            regex: { type: 'array', items: { type: 'string' }, description: 'Regex script names (or ids) to read' },
+        },
+    },
+};
+
+function _sessionHasPreset() {
+    try { return !!getSessionPreset(getCurrentSession()); } catch (_) { return false; }
+}
+
 export function getEnabledTools() {
     const s = getSettings();
-    if (!s.toolsEnabled) return [];
-    return TOOL_DEFINITIONS.filter(t => s[t.settingKey] !== false);
+    const tools = s.toolsEnabled ? TOOL_DEFINITIONS.filter(t => s[t.settingKey] !== false) : [];
+    if (_sessionHasPreset()) tools.push(READ_PRESET_TOOL);
+    return tools;
 }
 
 export function buildAnthropicToolsPayload() {
@@ -21,6 +44,8 @@ export function buildAnthropicToolsPayload() {
 export async function executeTool(toolName, toolInput) {
     const ctx = SillyTavern.getContext();
     switch (toolName) {
+        case 'read_preset':
+            return readPresetItems(getSessionPreset(getCurrentSession()), toolInput || {});
         case 'search_chat': {
             const msgs = ctx.chat || [];
             let rawQueries = Array.isArray(toolInput.queries) ? toolInput.queries : (Array.isArray(toolInput.query) ? toolInput.query : [toolInput.query || '']);
@@ -325,4 +350,4 @@ export function buildToolCallsSystemBlock() {
         .replace('{{tool_call_format}}', TOOL_CALL_FORMAT_BLOCK);
         
     return '\n\n' + _ensureWrapped(finalPrompt, 'tool_calls_system');
-}
+}

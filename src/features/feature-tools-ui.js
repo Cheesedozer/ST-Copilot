@@ -8,7 +8,7 @@ export function createToolCallEl(tc) {
     const item = document.createElement('div');
     item.className = 'scp-tool-call-item scp-inline-tool-call';
     item.dataset.toolId = tc.id;
-    const def = TOOL_DEFINITIONS.find(d => d.name === tc.name);
+    const def = TOOL_DEFINITIONS.find(d => d.name === tc.name) || (tc.name === 'read_preset' ? { icon: 'fa-sliders' } : null);
     const iconClass = def?.icon || 'fa-screwdriver-wrench';
     
     const isWarning = tc.status === 'warning';
@@ -182,4 +182,4 @@ export async function executeAskUser(input, msgEl) {
         if (body) body.appendChild(wrap);
         inp.focus();
     });
-}
+}
