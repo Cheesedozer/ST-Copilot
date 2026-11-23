@@ -14,7 +14,7 @@ import { _getSummaryceptionSummary } from './integrations/integ-summaryception.j
 import { applyRegexIfEnabled } from './integrations/integ-regex.js';
 
 import { buildLorebookContextBlock, buildLBAIInstructions, expandOutletsAsync } from './features/feature-lorebook-engine.js';
-import { buildCharacterContextBlock, buildCharEditAIInstructions } from './features/feature-character-engine.js';
+import { buildCharacterContextBlock, buildCharEditAIInstructions, buildCardGuideInstructions } from './features/feature-character-engine.js';
 import { buildChatEditAIInstructions } from './features/feature-chatedit-engine.js';
 import { buildMemoryContextBlock, buildMemoryAIInstructions, processMemoryUpdates, stripMemoryBlock } from './features/feature-memory.js';
 import { buildToolCallsSystemBlock, parseToolCallsFromText, parseToolCallsLenient, mentionsToolCall, executeTool, getEnabledTools } from './features/feature-tools-engine.js';
@@ -97,12 +97,13 @@ export async function buildSystemContent(settings, preset = null) {
 
     const aiInstructions = buildLBAIInstructions(settings).trim();
     const charEditDirective = buildCharEditAIInstructions(settings).trim();
+    const cardGuide = buildCardGuideInstructions(settings).trim();
     const chatEditDirective = buildChatEditAIInstructions(settings).trim();
     const memoryAIInstr = buildMemoryAIInstructions(settings).trim();
     const toolsBlock = buildToolCallsSystemBlock().trim();
     const presetDirective = preset ? buildPresetEditAIInstructions(preset) : '';
 
-    const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
+    const modules = [memoryAIInstr, aiInstructions, charEditDirective, cardGuide, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
     if (modules.length > 0) {
         const reminder = `\n\n[Reminder: changes are only applied through the structured blocks described above. Describing a change in plain text does not apply it.]`;
         parts.push(`\n\n<modules>\n${modules.join('\n\n')}${reminder}\n</modules>`);

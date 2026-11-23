@@ -161,6 +161,7 @@
             <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ce-post-history"><span>Post-History Instructions</span></label>
             <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ce-alt-greetings"><span>Alternate Greetings <span class="scp-sp-hint">(off by default — can be large)</span></span></label>
             <div id="scp-sp-ce-alt-greetings-picker" style="display:none;margin-top:4px"></div>
+            <label class="scp-sp-check" title="Never sent to the roleplay AI. Card Review uses it to record agreed design decisions."><input type="checkbox" id="scp-sp-ce-creator-notes"><span>Creator Notes <span class="scp-sp-hint">(off by default — used by Card Review)</span></span></label>
           </div>
           <div class="scp-sp-field" style="margin-top:8px">
             <label class="scp-sp-label">Main Chat Depth</label>
@@ -198,6 +199,12 @@
             <label class="scp-sp-label">AI Edit Prompt <span class="scp-sp-hint">macros: {{char_edit_fields}}, {{char_edit_format}}, {{char_create_format}}</span></label>
             <textarea class="scp-sp-textarea" id="scp-sp-char-edit-prompt" rows="5" style="font-family:monospace;font-size:11px"></textarea>
             <button class="scp-action-btn" id="scp-sp-reset-char-edit-prompt" style="margin-top:4px">${I.refresh}<span>Reset to Default</span></button>
+          </div>
+          <label class="scp-sp-check" style="margin-top:8px" title="Teaches Copilot how to write and review cards. Sent only while character editing is on."><input type="checkbox" id="scp-sp-card-guide-enabled"><span>Use Card Craft Guide <span class="scp-sp-hint">(~1,500 tokens)</span></span></label>
+          <div class="scp-sp-field" style="margin-top:6px">
+            <label class="scp-sp-label">Card Craft Guide <span class="scp-sp-hint">how cards should be written and reviewed; edit freely</span></label>
+            <textarea class="scp-sp-textarea" id="scp-sp-card-guide-prompt" rows="6" style="font-family:monospace;font-size:11px"></textarea>
+            <button class="scp-action-btn" id="scp-sp-reset-card-guide-prompt" style="margin-top:4px">${I.refresh}<span>Reset to Default</span></button>
           </div>
         </div>
 
@@ -424,6 +431,10 @@
               <button class="scp-sp-ov-clear" data-ovkey="charField_alternate_greetings" title="Clear override" disabled>↺</button>
             </div>
             <div id="scp-sp-ov-ce-alt-greetings-picker" style="display:none;margin-top:4px;padding-left:14px"></div>
+            <div class="scp-sp-ov-check-row">
+              <label class="scp-sp-check"><input type="checkbox" id="scp-sp-ov-ce-creator-notes"><span>Creator Notes</span></label>
+              <button class="scp-sp-ov-clear" data-ovkey="charField_creator_notes" title="Clear override" disabled>↺</button>
+            </div>
 
             <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,.06);display:flex;flex-direction:column;gap:5px">
               <div class="scp-sp-label" style="margin-bottom:2px">Third-party Extension Support</div>

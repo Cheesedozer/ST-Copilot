@@ -1,4 +1,4 @@
-import { THEME_PRESETS, THEME_VAR_DEFS, THEME_CSS_MAP, EXT_DISPLAY, DEFAULT_SYSTEM_PROMPT, DEFAULT_CHAR_EDIT_DIRECTIVE, DEFAULT_LB_MANAGE_PROMPT, DEFAULT_CHAT_EDIT_DIRECTIVE, TOOL_DEFINITIONS, DEFAULT_TOOLS_PROMPT, DEFAULT_MEMORY_PROMPT, I } from '../constants.js';
+import { THEME_PRESETS, THEME_VAR_DEFS, THEME_CSS_MAP, EXT_DISPLAY, DEFAULT_SYSTEM_PROMPT, DEFAULT_CHAR_EDIT_DIRECTIVE, DEFAULT_LB_MANAGE_PROMPT, DEFAULT_CHAT_EDIT_DIRECTIVE, DEFAULT_CARD_GUIDE_PROMPT, TOOL_DEFINITIONS, DEFAULT_TOOLS_PROMPT, DEFAULT_MEMORY_PROMPT, I } from '../constants.js';
 import { state } from '../state.js';
 import { getSettings, saveSettings, getEffectiveSettings, setSessionOverride, clearAllSessionOverrides, getBindingKey, hasSessionOverrides, saveSessionsToMetadata, getCurrentSession, getSessionOverrides, getChatBucket, initChatBucket } from '../session.js';
 import { showCustomDialog, escHtml } from '../utils/util-dom.js';
@@ -94,6 +94,10 @@ const _SETTINGS_DEF = [
     { key: 'charEditPrompt', stId: 'scp-char-edit-prompt', spId: 'scp-sp-char-edit-prompt', type: 'textarea', updCtx: true, profileKey: true,
       fromSetting: s => s.charEditPrompt || DEFAULT_CHAR_EDIT_DIRECTIVE.trim(),
       toVal: v => v.trim() === DEFAULT_CHAR_EDIT_DIRECTIVE.trim() ? '' : v },
+    { key: 'cardGuideEnabled', stId: 'scp-card-guide-enabled', spId: 'scp-sp-card-guide-enabled', type: 'checkbox', updCtx: true, profileKey: true },
+    { key: 'cardGuidePrompt', stId: 'scp-card-guide-prompt', spId: 'scp-sp-card-guide-prompt', type: 'textarea', updCtx: true, profileKey: true,
+      fromSetting: s => s.cardGuidePrompt || DEFAULT_CARD_GUIDE_PROMPT.trim(),
+      toVal: v => v.trim() === DEFAULT_CARD_GUIDE_PROMPT.trim() ? '' : v },
 
     // ── Lorebook ──────────────────────────────────────────────────────────────
     { key: 'lorebookAIManageEnabled', stId: 'scp-lb-ai-enabled-st', spId: 'scp-sp-lb-ai-enabled', type: 'checkbox', profileKey: true },
@@ -150,6 +154,7 @@ const _CE_FIELDS_DEF = [
     { fk: 'system_prompt',             stId: 'scp-ce-system-prompt',  spId: 'scp-sp-ce-system-prompt',  ovId: 'scp-sp-ov-ce-system-prompt' },
     { fk: 'post_history_instructions', stId: 'scp-ce-post-history',   spId: 'scp-sp-ce-post-history',   ovId: 'scp-sp-ov-ce-post-history' },
     { fk: 'alternate_greetings',       stId: 'scp-ce-alt-greetings',  spId: 'scp-sp-ce-alt-greetings',  ovId: 'scp-sp-ov-ce-alt-greetings', altGreetingPicker: true },
+    { fk: 'creator_notes',             stId: 'scp-ce-creator-notes',  spId: 'scp-sp-ce-creator-notes',  ovId: 'scp-sp-ov-ce-creator-notes' },
 ];
 
 // Mapping override keys to elements (for the override reset button)
@@ -173,6 +178,7 @@ const _OV_EL_MAP = {
     charField_authors_note: ['scp-sp-ov-ce-authors-note'], charField_system_prompt: ['scp-sp-ov-ce-system-prompt'],
     charField_post_history_instructions: ['scp-sp-ov-ce-post-history'],
     charField_alternate_greetings: ['scp-sp-ov-ce-alt-greetings'],
+    charField_creator_notes: ['scp-sp-ov-ce-creator-notes'],
     forceStreaming: [],
 };
 
@@ -889,6 +895,12 @@ export function setupSettingsHandlers() {
         toastr.success(`${label} reset.`, EXT_DISPLAY);
     };
     document.getElementById('scp-reset-prompt')?.addEventListener('click', () => _resetPrompt('systemPrompt', DEFAULT_SYSTEM_PROMPT, 'scp-sysprompt', 'scp-sp-sysprompt', 'System Prompt'));
+    ['scp-reset-card-guide-prompt', 'scp-sp-reset-card-guide-prompt'].forEach(btnId => document.getElementById(btnId)?.addEventListener('click', async () => {
+        const ok = await showCustomDialog({ type: 'confirm', title: 'Reset Card Craft Guide', message: 'Reset to built-in default?' }); if (!ok) return;
+        getSettings().cardGuidePrompt = ''; saveSettings(); _markDirty('config');
+        ['scp-card-guide-prompt', 'scp-sp-card-guide-prompt'].forEach(id => { const el = document.getElementById(id); if (el) el.value = DEFAULT_CARD_GUIDE_PROMPT.trim(); });
+        import('./ui-chat.js').then(m => m.updateMsgCount(getCurrentSession())); toastr.success('Card craft guide reset.', EXT_DISPLAY);
+    }));
     document.getElementById('scp-reset-char-edit-prompt')?.addEventListener('click', async () => {
         const ok = await showCustomDialog({ type: 'confirm', title: 'Reset Char Edit Prompt', message: 'Reset to built-in default?' }); if (!ok) return;
         getSettings().charEditPrompt = ''; saveSettings(); _markDirty('config');

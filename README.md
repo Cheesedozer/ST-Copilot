@@ -121,6 +121,12 @@ Attach a Chat Completion preset `.json` with the paperclip and ask for changes, 
 
 ---
 
+### 10. Card Craft Guide & Card Review
+Turn on **Use Card Craft Guide** (Settings, Character Card AI Edits) and Copilot writes and reviews cards with a shared philosophy, condensed from *The Character Foundry v3*: a goal that exists without {{user}}, behaviors instead of labels, voice with a cause, and a clear job for each field. It adapts to companion, NSFW, scenario and world cards. The guide is plain text you can edit, and **Reset to Default** brings back the built-in version.
+*   Click the **🩺 Card Review** quick prompt to review the current card. Copilot first reports: what kind of card it is, whether description, voice and behavior are clearly defined (with options if not), where the card differs from the guide (each finding quotes the line and is rated *changes how it plays*, *minor* or *matter of taste*, and "works as is" is a valid verdict), and its questions for you.
+*   Nothing is changed until you say **rewrite**. Copilot then proposes edits you review as usual, keeping lines that already work.
+*   Enable **Creator Notes** under "Character fields sent to AI context" and Copilot records the agreed design decisions there. Creator Notes are never sent to the roleplay AI.
+
 ## Installation
 
 1. Open SillyTavern and navigate to the **Extensions** menu (the plug icon).
@@ -131,6 +137,11 @@ Attach a Chat Completion preset `.json` with the paperclip and ask for changes, 
 ---
 
 ## 📜 Changelog History
+### V2.10.0
+*   **Card Craft Guide:** An optional, editable guide that teaches Copilot how to write and review character cards.
+*   **Card Review Quick Prompt:** Reviews the current card first, asks questions, and rewrites only when you say so.
+*   **Creator Notes:** Copilot can read and edit Creator Notes (off by default), used to record agreed design decisions.
+
 ### V2.9.0
 *   **Character Manager:** Introduced a comprehensive manager to edit character fields and define granular context inclusion rules for each character.
 *   **Group Chat Intelligence:** Copilot can now target and modify individual character data within group chats.

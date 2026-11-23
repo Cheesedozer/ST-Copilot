@@ -120,6 +120,79 @@ New character format:
 {{char_create_format}}
 </output_format>`;
 
+  // Card-writing philosophy, condensed from "The Character Foundry v3" (behavioral
+  // descriptions: Archetype_builder; friction and voice: Huge-Centipede; defining details:
+  // likesumiink; goal/motivation/conflict: Kristen Kieffer; body/environment/soul: Lajos Egri).
+  // Sent only while character editing and the guide are both enabled.
+  const DEFAULT_CARD_GUIDE_PROMPT = `<purpose>
+This guide is how to write and review character cards well. A card is instructions for improvising, not a biography: keep a line only if it changes what the roleplay model writes. The roleplay model treats everything in a card as something to bring up, so every detail costs attention as well as tokens.
+
+When to apply it: for new cards, and for rewrites the Human has asked for or approved. For a small edit to an existing card, keep the card's current format and voice. Where this guide and the style defaults in <character_management> disagree, this guide wins.
+
+Everything here is a default, not a requirement. When reviewing, a part that works is fine as is, even if it differs from this guide.
+</purpose>
+
+<field_jobs>
+Each field has a job, set by how long it stays true.
+- description: always true; sent every turn. Who {{char}} is, what they want, how they act and talk. At most about 2,000 tokens. Write prose, grouped into a few XML sections, for example <appearance>, <history>, <drive>, <behavior>, <voice>, and optionally <intimacy>. Tag sections, not individual lines, and use only the sections the card needs.
+- scenario: true right now. {{user}}'s role and how much power they have relative to {{char}}, the current situation, what makes {{char}}'s goal harder, and one line on where the goal stands. Present tense, no backstory. Update the goal line as the story moves; update the description only when the goal itself changes.
+- first_mes: the opening moment and the main voice sample. The roleplay model copies its length, style, level of detail and voice, so write the version of {{char}} to keep. 150–400 words, {{char}} already doing something (ideally toward the goal), ending on a hook. Show the relationship from the scenario instead of explaining it again. Never act, speak or think for {{user}}.
+- personality: optional. If used, keep it to a short summary that doesn't repeat the description.
+- mes_example: optional; voice only, with no events, because some models treat events in examples as things that happened.
+- creator_notes: never sent to the roleplay model. Record design decisions here (motivation, goal, blocks, key behaviors, open questions) so later reviews start from what was agreed.
+</field_jobs>
+
+<engine>
+What makes a character pursue something instead of waiting to be prompted:
+1. Motivation: the deep want, a feeling (to be free, to be seen, to prove something).
+2. Goal: something concrete they are pursuing. It exists before {{user}} arrives and would continue if {{user}} left, they could take a step toward it today, it can't be finished in one conversation, and it stops making sense if the motivation changes. {{user}} can help, block, tempt or complicate it, but is not the finish line.
+3. What blocks them from inside: a fear, or a gap between who they think they are and who they are. A fear that touches the goal drives the story; one that doesn't is only texture.
+4. One disproportionate behavior: something specific, observable and a little irrational that the block causes. It counters the model's habit of writing rational, helpful characters.
+Check: "{{char}} wants [goal] because [motivation], but [block]." Without a "but", the character has a wish, not a conflict. Obstacles from outside belong in the scenario.
+</engine>
+
+<behaviors>
+Write behaviors, not labels. "Confident" gives the model a word to repeat; a behavior gives it something to generate from.
+Formula: "When [trigger], {{char}} usually [does X], because [reason]. But when [break trigger], they [do Y]." "Usually" gives a default with room to vary; a hard rule makes the model run the same script every time.
+Aim for 4–6 behaviors across different situations, including:
+- a control strategy (competence, charm, humor, planning, withdrawal, caretaking...) and what happens when it fails;
+- at least one break: what gets under their skin, or what happens when someone names the mask;
+- at least one proactive behavior triggered by {{char}}'s own goal, not by {{user}};
+- voice as a behavior with a cause and conditions: register, sentence length, humor, and what changes under pressure. If an accent, slang or profanity should survive the model's habit of cleaning it up, say so outright and give the reason.
+Match intensity to the character; not every behavior needs a dramatic psychological root.
+Keep body, voice and hard constraints fixed so the character stays recognizable. Let choices vary.
+</behaviors>
+
+<specificity>
+Anything left out gets the model's most average guess. For each detail ask: if the model had to guess this, what would it guess, and would that guess flatten the character? If yes, define it and give its cause. If no, cut it.
+</specificity>
+
+<card_types>
+Identify the card type first and adapt the guide to it.
+- Single character: everything above applies.
+- Companion, romance or NSFW-focused: centering {{user}} may be the point, so the engine is optional and can be small. Prioritize consistent body facts, voice, and intimacy behaviors written with the same formula, run through the character's motivation and fears rather than labels like "dominant". Alternate greetings can open closer to the scene the Human wants.
+- Scenario: the situation is the protagonist. The scenario field carries the pressure, what keeps it from resolving, and how it escalates. Recurring NPCs each get a compact engine: goal, block, one behavior, one voice line.
+- World or narrator: {{char}} is the narrator. Define the narrator's voice and the world's rules; give factions and key NPCs goals so the world acts on its own (events, deadlines, third parties). Move bulk lore into lorebook entries instead of the description.
+- Group chat member: the card holds only that character. Shared world facts belong in a lorebook or the scenario.
+</card_types>`;
+
+  // Quick prompt that starts the review-then-rewrite workflow. Quick prompts are
+  // macro-expanded before sending, so {{user}} is avoided here on purpose.
+  const CARD_REVIEW_QUICK_PROMPT = {
+      id: 'qp_card_review',
+      label: 'Card Review',
+      icon: '🩺',
+      text: `Review {{char}}'s character card in two phases. This is phase 1: report only. Do not output a character-changes block yet.
+
+1. Card type: what kind of card is this (single character, companion/romance, NSFW-focused, scenario, world/narrator, group member)? If it's unclear, ask me.
+2. Description, voice and personality/behavior: is each clearly defined? If one is thin, offer 2–3 options built from what is already in the card and anything I've told you.
+3. If a card craft guide is in your instructions, compare the card with it, adapted to the card's type. For each finding, quote the line it comes from and rate it: changes how it plays / minor / matter of taste. "Works as is" is a valid verdict; say so for the parts that are fine.
+4. Any other problems you notice, such as contradictions between fields, acting or speaking for the persona, token bloat, or details that would work better as lorebook entries.
+5. List the questions you need answered, at most five, most important first.
+
+Then wait. We'll go back and forth until we agree on the character. When I say "rewrite", propose the changes: keep lines that already work word for word, and if creator_notes is an editable field, record the agreed decisions there.`,
+  };
+
   const DEFAULT_CHAT_EDIT_DIRECTIVE = `<context>
 You can edit the main roleplay chat. Messages in \`<roleplay_context>\` appear as \`<msg index="N" role="user|assistant">\`; use those index numbers.
 </context>
@@ -195,7 +268,8 @@ replacement text
   "personality": "Personality summary",
   "scenario": "Scenario / setting",
   "first_mes": "Opening message",
-  "mes_example": "<START>\\n*{{char}} glances up.* \\"Oh. It's you.\\""
+  "mes_example": "<START>\\n*{{char}} glances up.* \\"Oh. It's you.\\"",
+  "creator_notes": "Optional. Design notes for the Human; never sent to the roleplay model"
 }
 \`\`\``;
 
@@ -285,10 +359,21 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       'm8a14r9497',
       '16zfn93ijyf',
       'q508r5jjrd',
+      '20jhlz90wua',
   ];
 
       // ─── Changelog Data ──────────────────────────────────────────────────────────
   const CHANGELOG = [
+      {
+          version: '2.10.0',
+          date: '11/23/2026',
+          announce: true,
+          notes: [
+              '<strong>Card Craft Guide</strong> — An optional, editable guide that teaches Copilot how to write and review character cards: goals and motivation, behaviors instead of labels, voice with causes, and what each field is for. Adapts to companion, NSFW, scenario and world cards. Toggle and edit it under Character Card AI Edits.',
+              '<strong>Card Review Quick Prompt</strong> — A new 🩺 quick prompt reviews the current card first (with quoted evidence and severity, and "works as is" when it does), asks clarifying questions, and rewrites only when you say so.',
+              '<strong>Creator Notes</strong> — Copilot can now read and edit the card\'s Creator Notes (never sent to the roleplay model), used to record agreed design decisions. Off by default under "Character fields sent to AI context".'
+          ],
+      },
       {
           version: '2.9.1',
           date: '9/23/2026',
@@ -1530,6 +1615,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
               { id: 'qp_d3', label: 'Summary', icon: '📋', text: 'Summarize everything that has happened in the roleplay so far.' },
               { id: 'qp_d4', label: 'Feelings', icon: '💭', text: 'What is {{char}} likely feeling right now and why?' },
               { id: 'qp_d5', label: 'Next?', icon: '🎯', text: 'What are the most interesting directions the story could go next?' },
+              { ...CARD_REVIEW_QUICK_PROMPT },
           ],
           quickPromptSets: {},
           activeQuickPromptSet: '',
@@ -1542,12 +1628,9 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           applyRegexToContext: true,
           charEditAIEnabled: true,
           charEditPrompt: '',
-          charEditFields: {
-              tags: true, description: true, personality: true,
-              scenario: true, first_mes: true, mes_example: true,
-              alternate_greetings: false, authors_note: true,
-              system_prompt: true, post_history_instructions: true, name: false,
-          },
+          cardGuideEnabled: true,
+          cardGuidePrompt: '',
+          charEditFields: _defaultCharEditFields(),
           completionSound: 'none',
           completionSoundVolume: 80,
           completionSoundOnlyWhenUnfocused: false,
@@ -1587,12 +1670,46 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       for (const [k, v] of Object.entries(defaults)) {
           if (s[k] === undefined) s[k] = v;
       }
+      _fillCharEditFields(s);
+      _migrateCardReviewQuickPrompt(s);
       _migrateDefaultPrompts(s);
       return s;
   }
 
+  // A hoisted function rather than a const: getSettings() can run before this module's
+  // body finishes evaluating in the bundled build (circular imports).
+  function _defaultCharEditFields() {
+      return {
+          tags: true, description: true, personality: true,
+          scenario: true, first_mes: true, mes_example: true,
+          alternate_greetings: false, authors_note: true,
+          system_prompt: true, post_history_instructions: true, name: false,
+          creator_notes: false,
+      };
+  }
+
+  // Fields added in later versions are missing from saved settings. Fill them with their
+  // defaults so the settings checkboxes (which treat "missing" as on) match what is sent.
+  function _fillCharEditFields(s) {
+      if (!s.charEditFields || typeof s.charEditFields !== 'object') return;
+      for (const [k, v] of Object.entries(_defaultCharEditFields())) {
+          if (s.charEditFields[k] === undefined) s.charEditFields[k] = v;
+      }
+  }
+
+  // Existing installs keep their saved quick prompt list, so the Card Review prompt is
+  // added once. A flag records that, so a user who deletes it doesn't get it back.
+  function _migrateCardReviewQuickPrompt(s) {
+      if (s.cardReviewQPAdded) return;
+      s.cardReviewQPAdded = true;
+      if (!Array.isArray(s.quickPrompts)) return;
+      if (!s.quickPrompts.some(q => q && q.id === CARD_REVIEW_QUICK_PROMPT.id)) {
+          s.quickPrompts.push({ ...CARD_REVIEW_QUICK_PROMPT });
+      }
+  }
+
   // Prompt settings where '' means "use the built-in default".
-  const PROMPT_SETTING_KEYS = ['systemPrompt', 'lorebookManagePrompt', 'memoryManagePrompt', 'toolsSystemPrompt', 'charEditPrompt', 'chatEditPrompt'];
+  const PROMPT_SETTING_KEYS = ['systemPrompt', 'lorebookManagePrompt', 'memoryManagePrompt', 'toolsSystemPrompt', 'charEditPrompt', 'chatEditPrompt', 'cardGuidePrompt'];
   let _promptsMigrated = false;
 
   // Older versions saved the full default text, which froze users on outdated prompts.
@@ -5299,6 +5416,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           scenario: d.scenario || char.scenario,
           first_mes: d.first_mes || char.first_mes,
           mes_example: d.mes_example || char.mes_example,
+          creator_notes: d.creator_notes || char.creator_notes || char.creatorcomment,
       };
 
       const isMainChar = char.avatar === ctx.characters?.[ctx.characterId]?.avatar;
@@ -5347,7 +5465,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
 
   function buildCharEditAIInstructions(settings) {
       if (!settings.charEditAIEnabled) return '';
-      const baseFields = ['name', 'tags', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'authors_note', 'alternate_greetings', 'system_prompt', 'post_history_instructions'];
+      const baseFields = ['name', 'tags', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'authors_note', 'alternate_greetings', 'system_prompt', 'post_history_instructions', 'creator_notes'];
       const fieldsList = baseFields.filter(k => k === 'name' || getEffectiveCharField(settings, k));
       
       if (settings.includeUserPersonality && !fieldsList.includes('user_persona')) {
@@ -5376,6 +5494,15 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           .replace('{{char_create_format}}', CHAR_CREATE_FORMAT_BLOCK);
           
       return _ensureWrapped(`${base}${evolutiaDocs}`, 'character_management');
+  }
+
+  // The card craft guide rides along with character editing: it only shapes how cards are
+  // written and reviewed, so it is pointless (and costs tokens) when editing is off.
+  function buildCardGuideInstructions(settings) {
+      if (!settings.charEditAIEnabled || !settings.cardGuideEnabled) return '';
+      const text = (typeof settings.cardGuidePrompt === 'string' && settings.cardGuidePrompt.trim())
+          ? settings.cardGuidePrompt : DEFAULT_CARD_GUIDE_PROMPT;
+      return _ensureWrapped(text, 'card_craft_guide');
   }
 
   function _levenshtein(a, b) {
@@ -5472,6 +5599,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       persona: 'user_persona', persona_description: 'user_persona',
       alternate_greeting: 'alternate_greetings', alt_greetings: 'alternate_greetings',
       author_note: 'authors_note', authors_notes: 'authors_note',
+      creator_note: 'creator_notes', creators_notes: 'creator_notes', creator_comment: 'creator_notes', creatorcomment: 'creator_notes',
   };
 
   function _normalizeFieldName(field) {
@@ -5694,6 +5822,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       if (fieldId === 'alternate_greetings') return d.alternate_greetings || [];
       if (fieldId === 'system_prompt') return d.system_prompt || char.system_prompt || '';
       if (fieldId === 'post_history_instructions') return d.post_history_instructions || char.post_history_instructions || '';
+      if (fieldId === 'creator_notes') return d.creator_notes || char.creator_notes || char.creatorcomment || '';
       return d[fieldId] || char[fieldId] || '';
   }
 
@@ -5966,6 +6095,10 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
 
       if (fieldId === 'alternate_greetings') {
           char.data.alternate_greetings = newValue;
+      } else if (fieldId === 'creator_notes') {
+          // V1 cards keep creator notes in the top-level "creatorcomment"; keep both in step.
+          char.data.creator_notes = newValue;
+          char.creatorcomment = newValue;
       } else {
           char.data[fieldId] = newValue;
           char[fieldId] = newValue;
@@ -6000,6 +6133,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           mes_example: 'mes_example_textarea',
           system_prompt: 'system_prompt_textarea',
           post_history_instructions: 'post_history_instructions_textarea',
+          creator_notes: 'creator_notes_textarea',
       };
 
       if (_isOpenInEditor(ctx, char)) {
@@ -6036,6 +6170,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       formData.append('first_mes', data.first_mes || '');
       formData.append('mes_example', data.mes_example || '');
       formData.append('tags', tagsString);
+      if (data.creator_notes) formData.append('creator_notes', data.creator_notes);
 
       const headers = ctx.getRequestHeaders();
       delete headers['Content-Type'];
@@ -6319,7 +6454,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       if (!changes?.length) return;
       try {
           const getFieldLabel = (f) => {
-              const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions' };
+              const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions', creator_notes:'Creator Notes' };
               if (LBLS[f]) return LBLS[f];
               if (f && f.startsWith('evolutia_char:')) return `Aspect (Char): ${f.split('evolutia_char:')[1]}`;
               if (f && f.startsWith('evolutia_user:')) return `Aspect (User): ${f.split('evolutia_user:')[1]}`;
@@ -6394,6 +6529,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           first_mes: creationData.first_mes || '',
           mes_example: creationData.mes_example || '',
           tags: Array.isArray(creationData.tags) ? creationData.tags.join(', ') : (creationData.tags || ''),
+          creator_notes: creationData.creator_notes || '',
       };
 
       const FIELDS = [
@@ -6404,6 +6540,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
           { key: 'scenario',    label: 'Scenario',         multiline: true, rows: 3 },
           { key: 'first_mes',   label: 'First Message',    multiline: true, rows: 3 },
           { key: 'mes_example', label: 'Example Dialogue', multiline: true, rows: 3 },
+          { key: 'creator_notes', label: 'Creator Notes',  multiline: true, rows: 3, hint: 'not sent to the roleplay AI' },
       ];
 
       const card = document.createElement('div');
@@ -6561,7 +6698,7 @@ To call a tool, output a \`tool_call\` block. The result is returned to you, and
       const itemStates = editableChanges.map(() => 'pending');
 
       const getFieldLabel = (f) => {
-          const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions' };
+          const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions', creator_notes:'Creator Notes' };
           if (LBLS[f]) return LBLS[f];
           if (f && f.startsWith('evolutia_char:')) return `Aspect (Char): ${f.split('evolutia_char:')[1]}`;
           if (f && f.startsWith('evolutia_user:')) return `Aspect (User): ${f.split('evolutia_user:')[1]}`;
@@ -10244,6 +10381,10 @@ ${scopeHtml}
       { key: 'charEditPrompt', stId: 'scp-char-edit-prompt', spId: 'scp-sp-char-edit-prompt', type: 'textarea', updCtx: true, profileKey: true,
         fromSetting: s => s.charEditPrompt || DEFAULT_CHAR_EDIT_DIRECTIVE.trim(),
         toVal: v => v.trim() === DEFAULT_CHAR_EDIT_DIRECTIVE.trim() ? '' : v },
+      { key: 'cardGuideEnabled', stId: 'scp-card-guide-enabled', spId: 'scp-sp-card-guide-enabled', type: 'checkbox', updCtx: true, profileKey: true },
+      { key: 'cardGuidePrompt', stId: 'scp-card-guide-prompt', spId: 'scp-sp-card-guide-prompt', type: 'textarea', updCtx: true, profileKey: true,
+        fromSetting: s => s.cardGuidePrompt || DEFAULT_CARD_GUIDE_PROMPT.trim(),
+        toVal: v => v.trim() === DEFAULT_CARD_GUIDE_PROMPT.trim() ? '' : v },
 
       // ── Lorebook ──────────────────────────────────────────────────────────────
       { key: 'lorebookAIManageEnabled', stId: 'scp-lb-ai-enabled-st', spId: 'scp-sp-lb-ai-enabled', type: 'checkbox', profileKey: true },
@@ -10300,6 +10441,7 @@ ${scopeHtml}
       { fk: 'system_prompt',             stId: 'scp-ce-system-prompt',  spId: 'scp-sp-ce-system-prompt',  ovId: 'scp-sp-ov-ce-system-prompt' },
       { fk: 'post_history_instructions', stId: 'scp-ce-post-history',   spId: 'scp-sp-ce-post-history',   ovId: 'scp-sp-ov-ce-post-history' },
       { fk: 'alternate_greetings',       stId: 'scp-ce-alt-greetings',  spId: 'scp-sp-ce-alt-greetings',  ovId: 'scp-sp-ov-ce-alt-greetings', altGreetingPicker: true },
+      { fk: 'creator_notes',             stId: 'scp-ce-creator-notes',  spId: 'scp-sp-ce-creator-notes',  ovId: 'scp-sp-ov-ce-creator-notes' },
   ];
 
   // Mapping override keys to elements (for the override reset button)
@@ -10323,6 +10465,7 @@ ${scopeHtml}
       charField_authors_note: ['scp-sp-ov-ce-authors-note'], charField_system_prompt: ['scp-sp-ov-ce-system-prompt'],
       charField_post_history_instructions: ['scp-sp-ov-ce-post-history'],
       charField_alternate_greetings: ['scp-sp-ov-ce-alt-greetings'],
+      charField_creator_notes: ['scp-sp-ov-ce-creator-notes'],
       forceStreaming: [],
   };
 
@@ -11039,6 +11182,12 @@ ${scopeHtml}
           toastr.success(`${label} reset.`, EXT_DISPLAY);
       };
       document.getElementById('scp-reset-prompt')?.addEventListener('click', () => _resetPrompt('systemPrompt', DEFAULT_SYSTEM_PROMPT, 'scp-sysprompt', 'scp-sp-sysprompt', 'System Prompt'));
+      ['scp-reset-card-guide-prompt', 'scp-sp-reset-card-guide-prompt'].forEach(btnId => document.getElementById(btnId)?.addEventListener('click', async () => {
+          const ok = await showCustomDialog({ type: 'confirm', title: 'Reset Card Craft Guide', message: 'Reset to built-in default?' }); if (!ok) return;
+          getSettings().cardGuidePrompt = ''; saveSettings(); _markDirty('config');
+          ['scp-card-guide-prompt', 'scp-sp-card-guide-prompt'].forEach(id => { const el = document.getElementById(id); if (el) el.value = DEFAULT_CARD_GUIDE_PROMPT.trim(); });
+          Promise.resolve().then(function () { return uiChat; }).then(m => m.updateMsgCount(getCurrentSession())); toastr.success('Card craft guide reset.', EXT_DISPLAY);
+      }));
       document.getElementById('scp-reset-char-edit-prompt')?.addEventListener('click', async () => {
           const ok = await showCustomDialog({ type: 'confirm', title: 'Reset Char Edit Prompt', message: 'Reset to built-in default?' }); if (!ok) return;
           getSettings().charEditPrompt = ''; saveSettings(); _markDirty('config');
@@ -14877,6 +15026,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       { title: 'Advanced', fields: [
           { key: 'system_prompt', label: 'Main Prompt Override', multiline: true },
           { key: 'post_history_instructions', label: 'Post-History Instructions', multiline: true },
+          { key: 'creator_notes', label: 'Creator Notes', multiline: true },
       ]},
   ];
 
@@ -14887,6 +15037,7 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
       { key: 'authors_note', label: "Author's Note" }, { key: 'system_prompt', label: 'Main Prompt Override' },
       { key: 'post_history_instructions', label: 'Post-History Instructions' },
       { key: 'alternate_greetings', label: 'Alternate Greetings' },
+      { key: 'creator_notes', label: 'Creator Notes' },
   ];
 
   // ─── Module State ─────────────────────────────────────────────────────────────
@@ -15635,12 +15786,13 @@ window.onerror=function(m){window.parent.postMessage({type:'scp-iframe-err',msg:
 
       const aiInstructions = buildLBAIInstructions(settings).trim();
       const charEditDirective = buildCharEditAIInstructions(settings).trim();
+      const cardGuide = buildCardGuideInstructions(settings).trim();
       const chatEditDirective = buildChatEditAIInstructions(settings).trim();
       const memoryAIInstr = buildMemoryAIInstructions(settings).trim();
       const toolsBlock = buildToolCallsSystemBlock().trim();
       const presetDirective = preset ? buildPresetEditAIInstructions(preset) : '';
 
-      const modules = [memoryAIInstr, aiInstructions, charEditDirective, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
+      const modules = [memoryAIInstr, aiInstructions, charEditDirective, cardGuide, chatEditDirective, presetDirective, toolsBlock].filter(Boolean);
       if (modules.length > 0) {
           const reminder = `\n\n[Reminder: changes are only applied through the structured blocks described above. Describing a change in plain text does not apply it.]`;
           parts.push(`\n\n<modules>\n${modules.join('\n\n')}${reminder}\n</modules>`);

@@ -213,7 +213,7 @@ export function logCharEditHistory(changes, statusStr, afterMsgId = null, charNa
     if (!changes?.length) return;
     try {
         const getFieldLabel = (f) => {
-            const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions' };
+            const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions', creator_notes:'Creator Notes' };
             if (LBLS[f]) return LBLS[f];
             if (f && f.startsWith('evolutia_char:')) return `Aspect (Char): ${f.split('evolutia_char:')[1]}`;
             if (f && f.startsWith('evolutia_user:')) return `Aspect (User): ${f.split('evolutia_user:')[1]}`;
@@ -288,6 +288,7 @@ export function renderCharCreationCard(creationData, msgEl) {
         first_mes: creationData.first_mes || '',
         mes_example: creationData.mes_example || '',
         tags: Array.isArray(creationData.tags) ? creationData.tags.join(', ') : (creationData.tags || ''),
+        creator_notes: creationData.creator_notes || '',
     };
 
     const FIELDS = [
@@ -298,6 +299,7 @@ export function renderCharCreationCard(creationData, msgEl) {
         { key: 'scenario',    label: 'Scenario',         multiline: true, rows: 3 },
         { key: 'first_mes',   label: 'First Message',    multiline: true, rows: 3 },
         { key: 'mes_example', label: 'Example Dialogue', multiline: true, rows: 3 },
+        { key: 'creator_notes', label: 'Creator Notes',  multiline: true, rows: 3, hint: 'not sent to the roleplay AI' },
     ];
 
     const card = document.createElement('div');
@@ -455,7 +457,7 @@ function _buildCharProposalCardForCharacter(changes, msgEl, char) {
     const itemStates = editableChanges.map(() => 'pending');
 
     const getFieldLabel = (f) => {
-        const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions' };
+        const LBLS = { name:'Name', tags:'Tags', description:'Description', personality:'Personality', scenario:'Scenario', first_mes:'First Message', mes_example:'Example Dialogue', authors_note:"Author's Note", user_persona:"User Persona", alternate_greetings:'Alternate Greetings', system_prompt:'Main Prompt Override', post_history_instructions:'Post-History Instructions', creator_notes:'Creator Notes' };
         if (LBLS[f]) return LBLS[f];
         if (f && f.startsWith('evolutia_char:')) return `Aspect (Char): ${f.split('evolutia_char:')[1]}`;
         if (f && f.startsWith('evolutia_user:')) return `Aspect (User): ${f.split('evolutia_user:')[1]}`;

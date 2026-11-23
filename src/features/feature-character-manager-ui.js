@@ -23,6 +23,7 @@ const FIELD_GROUPS = [
     { title: 'Advanced', fields: [
         { key: 'system_prompt', label: 'Main Prompt Override', multiline: true },
         { key: 'post_history_instructions', label: 'Post-History Instructions', multiline: true },
+        { key: 'creator_notes', label: 'Creator Notes', multiline: true },
     ]},
 ];
 
@@ -33,6 +34,7 @@ const OV_FIELDS = [
     { key: 'authors_note', label: "Author's Note" }, { key: 'system_prompt', label: 'Main Prompt Override' },
     { key: 'post_history_instructions', label: 'Post-History Instructions' },
     { key: 'alternate_greetings', label: 'Alternate Greetings' },
+    { key: 'creator_notes', label: 'Creator Notes' },
 ];
 
 // ─── Module State ─────────────────────────────────────────────────────────────
