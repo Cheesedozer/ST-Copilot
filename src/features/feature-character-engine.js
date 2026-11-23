@@ -1,4 +1,4 @@
-import { EXT_DISPLAY, CHAR_EDIT_FORMAT_BLOCK, CHAR_CREATE_FORMAT_BLOCK, DEFAULT_CHAR_EDIT_DIRECTIVE } from '../constants.js';
+import { EXT_DISPLAY, CHAR_EDIT_FORMAT_BLOCK, CHAR_CREATE_FORMAT_BLOCK, DEFAULT_CHAR_EDIT_DIRECTIVE, DEFAULT_CARD_GUIDE_PROMPT } from '../constants.js';
 import { getSettings, saveSettings, getCurrentSession } from '../session.js';
 import { _dbgAdd } from '../utils/util-debug.js';
 import { escHtml } from '../utils/util-dom.js';
@@ -83,6 +83,7 @@ function buildSingleCharacterBlock(settings, entity) {
         scenario: d.scenario || char.scenario,
         first_mes: d.first_mes || char.first_mes,
         mes_example: d.mes_example || char.mes_example,
+        creator_notes: d.creator_notes || char.creator_notes || char.creatorcomment,
     };
 
     const isMainChar = char.avatar === ctx.characters?.[ctx.characterId]?.avatar;
@@ -131,7 +132,7 @@ export function buildCharacterContextBlock(settings) {
 
 export function buildCharEditAIInstructions(settings) {
     if (!settings.charEditAIEnabled) return '';
-    const baseFields = ['name', 'tags', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'authors_note', 'alternate_greetings', 'system_prompt', 'post_history_instructions'];
+    const baseFields = ['name', 'tags', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'authors_note', 'alternate_greetings', 'system_prompt', 'post_history_instructions', 'creator_notes'];
     const fieldsList = baseFields.filter(k => k === 'name' || getEffectiveCharField(settings, k));
     
     if (settings.includeUserPersonality && !fieldsList.includes('user_persona')) {
@@ -160,6 +161,15 @@ export function buildCharEditAIInstructions(settings) {
         .replace('{{char_create_format}}', CHAR_CREATE_FORMAT_BLOCK);
         
     return _ensureWrapped(`${base}${evolutiaDocs}`, 'character_management');
+}
+
+// The card craft guide rides along with character editing: it only shapes how cards are
+// written and reviewed, so it is pointless (and costs tokens) when editing is off.
+export function buildCardGuideInstructions(settings) {
+    if (!settings.charEditAIEnabled || !settings.cardGuideEnabled) return '';
+    const text = (typeof settings.cardGuidePrompt === 'string' && settings.cardGuidePrompt.trim())
+        ? settings.cardGuidePrompt : DEFAULT_CARD_GUIDE_PROMPT;
+    return _ensureWrapped(text, 'card_craft_guide');
 }
 
 function _levenshtein(a, b) {
@@ -256,6 +266,7 @@ const FIELD_ALIASES = {
     persona: 'user_persona', persona_description: 'user_persona',
     alternate_greeting: 'alternate_greetings', alt_greetings: 'alternate_greetings',
     author_note: 'authors_note', authors_notes: 'authors_note',
+    creator_note: 'creator_notes', creators_notes: 'creator_notes', creator_comment: 'creator_notes', creatorcomment: 'creator_notes',
 };
 
 function _normalizeFieldName(field) {
@@ -483,6 +494,7 @@ export function getCharFieldValue(char, fieldId) {
     if (fieldId === 'alternate_greetings') return d.alternate_greetings || [];
     if (fieldId === 'system_prompt') return d.system_prompt || char.system_prompt || '';
     if (fieldId === 'post_history_instructions') return d.post_history_instructions || char.post_history_instructions || '';
+    if (fieldId === 'creator_notes') return d.creator_notes || char.creator_notes || char.creatorcomment || '';
     return d[fieldId] || char[fieldId] || '';
 }
 
@@ -755,6 +767,10 @@ export async function saveCharacterField(char, fieldId, newValue) {
 
     if (fieldId === 'alternate_greetings') {
         char.data.alternate_greetings = newValue;
+    } else if (fieldId === 'creator_notes') {
+        // V1 cards keep creator notes in the top-level "creatorcomment"; keep both in step.
+        char.data.creator_notes = newValue;
+        char.creatorcomment = newValue;
     } else {
         char.data[fieldId] = newValue;
         char[fieldId] = newValue;
@@ -789,6 +805,7 @@ export async function saveCharacterField(char, fieldId, newValue) {
         mes_example: 'mes_example_textarea',
         system_prompt: 'system_prompt_textarea',
         post_history_instructions: 'post_history_instructions_textarea',
+        creator_notes: 'creator_notes_textarea',
     };
 
     if (_isOpenInEditor(ctx, char)) {
@@ -825,6 +842,7 @@ export async function createCharacterAPI(data) {
     formData.append('first_mes', data.first_mes || '');
     formData.append('mes_example', data.mes_example || '');
     formData.append('tags', tagsString);
+    if (data.creator_notes) formData.append('creator_notes', data.creator_notes);
 
     const headers = ctx.getRequestHeaders();
     delete headers['Content-Type'];

@@ -3,6 +3,7 @@ import {
     EXT_DISPLAY, 
     THEME_PRESETS,
     KNOWN_DEFAULT_PROMPT_HASHES,
+    CARD_REVIEW_QUICK_PROMPT,
 } from './constants.js';
 import { _dbgAdd, _dbgDiffSettings } from './utils/util-debug.js';
 import { _repairJSON, promptHash } from './utils/util-text.js';
@@ -68,6 +69,7 @@ export function getSettings() {
             { id: 'qp_d3', label: 'Summary', icon: '📋', text: 'Summarize everything that has happened in the roleplay so far.' },
             { id: 'qp_d4', label: 'Feelings', icon: '💭', text: 'What is {{char}} likely feeling right now and why?' },
             { id: 'qp_d5', label: 'Next?', icon: '🎯', text: 'What are the most interesting directions the story could go next?' },
+            { ...CARD_REVIEW_QUICK_PROMPT },
         ],
         quickPromptSets: {},
         activeQuickPromptSet: '',
@@ -80,12 +82,9 @@ export function getSettings() {
         applyRegexToContext: true,
         charEditAIEnabled: true,
         charEditPrompt: '',
-        charEditFields: {
-            tags: true, description: true, personality: true,
-            scenario: true, first_mes: true, mes_example: true,
-            alternate_greetings: false, authors_note: true,
-            system_prompt: true, post_history_instructions: true, name: false,
-        },
+        cardGuideEnabled: true,
+        cardGuidePrompt: '',
+        charEditFields: _defaultCharEditFields(),
         completionSound: 'none',
         completionSoundVolume: 80,
         completionSoundOnlyWhenUnfocused: false,
@@ -125,12 +124,46 @@ export function getSettings() {
     for (const [k, v] of Object.entries(defaults)) {
         if (s[k] === undefined) s[k] = v;
     }
+    _fillCharEditFields(s);
+    _migrateCardReviewQuickPrompt(s);
     _migrateDefaultPrompts(s);
     return s;
 }
 
+// A hoisted function rather than a const: getSettings() can run before this module's
+// body finishes evaluating in the bundled build (circular imports).
+function _defaultCharEditFields() {
+    return {
+        tags: true, description: true, personality: true,
+        scenario: true, first_mes: true, mes_example: true,
+        alternate_greetings: false, authors_note: true,
+        system_prompt: true, post_history_instructions: true, name: false,
+        creator_notes: false,
+    };
+}
+
+// Fields added in later versions are missing from saved settings. Fill them with their
+// defaults so the settings checkboxes (which treat "missing" as on) match what is sent.
+function _fillCharEditFields(s) {
+    if (!s.charEditFields || typeof s.charEditFields !== 'object') return;
+    for (const [k, v] of Object.entries(_defaultCharEditFields())) {
+        if (s.charEditFields[k] === undefined) s.charEditFields[k] = v;
+    }
+}
+
+// Existing installs keep their saved quick prompt list, so the Card Review prompt is
+// added once. A flag records that, so a user who deletes it doesn't get it back.
+function _migrateCardReviewQuickPrompt(s) {
+    if (s.cardReviewQPAdded) return;
+    s.cardReviewQPAdded = true;
+    if (!Array.isArray(s.quickPrompts)) return;
+    if (!s.quickPrompts.some(q => q && q.id === CARD_REVIEW_QUICK_PROMPT.id)) {
+        s.quickPrompts.push({ ...CARD_REVIEW_QUICK_PROMPT });
+    }
+}
+
 // Prompt settings where '' means "use the built-in default".
-const PROMPT_SETTING_KEYS = ['systemPrompt', 'lorebookManagePrompt', 'memoryManagePrompt', 'toolsSystemPrompt', 'charEditPrompt', 'chatEditPrompt'];
+const PROMPT_SETTING_KEYS = ['systemPrompt', 'lorebookManagePrompt', 'memoryManagePrompt', 'toolsSystemPrompt', 'charEditPrompt', 'chatEditPrompt', 'cardGuidePrompt'];
 let _promptsMigrated = false;
 
 // Older versions saved the full default text, which froze users on outdated prompts.

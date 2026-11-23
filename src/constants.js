@@ -117,6 +117,79 @@ New character format:
 {{char_create_format}}
 </output_format>`;
 
+// Card-writing philosophy, condensed from "The Character Foundry v3" (behavioral
+// descriptions: Archetype_builder; friction and voice: Huge-Centipede; defining details:
+// likesumiink; goal/motivation/conflict: Kristen Kieffer; body/environment/soul: Lajos Egri).
+// Sent only while character editing and the guide are both enabled.
+export const DEFAULT_CARD_GUIDE_PROMPT = `<purpose>
+This guide is how to write and review character cards well. A card is instructions for improvising, not a biography: keep a line only if it changes what the roleplay model writes. The roleplay model treats everything in a card as something to bring up, so every detail costs attention as well as tokens.
+
+When to apply it: for new cards, and for rewrites the Human has asked for or approved. For a small edit to an existing card, keep the card's current format and voice. Where this guide and the style defaults in <character_management> disagree, this guide wins.
+
+Everything here is a default, not a requirement. When reviewing, a part that works is fine as is, even if it differs from this guide.
+</purpose>
+
+<field_jobs>
+Each field has a job, set by how long it stays true.
+- description: always true; sent every turn. Who {{char}} is, what they want, how they act and talk. At most about 2,000 tokens. Write prose, grouped into a few XML sections, for example <appearance>, <history>, <drive>, <behavior>, <voice>, and optionally <intimacy>. Tag sections, not individual lines, and use only the sections the card needs.
+- scenario: true right now. {{user}}'s role and how much power they have relative to {{char}}, the current situation, what makes {{char}}'s goal harder, and one line on where the goal stands. Present tense, no backstory. Update the goal line as the story moves; update the description only when the goal itself changes.
+- first_mes: the opening moment and the main voice sample. The roleplay model copies its length, style, level of detail and voice, so write the version of {{char}} to keep. 150–400 words, {{char}} already doing something (ideally toward the goal), ending on a hook. Show the relationship from the scenario instead of explaining it again. Never act, speak or think for {{user}}.
+- personality: optional. If used, keep it to a short summary that doesn't repeat the description.
+- mes_example: optional; voice only, with no events, because some models treat events in examples as things that happened.
+- creator_notes: never sent to the roleplay model. Record design decisions here (motivation, goal, blocks, key behaviors, open questions) so later reviews start from what was agreed.
+</field_jobs>
+
+<engine>
+What makes a character pursue something instead of waiting to be prompted:
+1. Motivation: the deep want, a feeling (to be free, to be seen, to prove something).
+2. Goal: something concrete they are pursuing. It exists before {{user}} arrives and would continue if {{user}} left, they could take a step toward it today, it can't be finished in one conversation, and it stops making sense if the motivation changes. {{user}} can help, block, tempt or complicate it, but is not the finish line.
+3. What blocks them from inside: a fear, or a gap between who they think they are and who they are. A fear that touches the goal drives the story; one that doesn't is only texture.
+4. One disproportionate behavior: something specific, observable and a little irrational that the block causes. It counters the model's habit of writing rational, helpful characters.
+Check: "{{char}} wants [goal] because [motivation], but [block]." Without a "but", the character has a wish, not a conflict. Obstacles from outside belong in the scenario.
+</engine>
+
+<behaviors>
+Write behaviors, not labels. "Confident" gives the model a word to repeat; a behavior gives it something to generate from.
+Formula: "When [trigger], {{char}} usually [does X], because [reason]. But when [break trigger], they [do Y]." "Usually" gives a default with room to vary; a hard rule makes the model run the same script every time.
+Aim for 4–6 behaviors across different situations, including:
+- a control strategy (competence, charm, humor, planning, withdrawal, caretaking...) and what happens when it fails;
+- at least one break: what gets under their skin, or what happens when someone names the mask;
+- at least one proactive behavior triggered by {{char}}'s own goal, not by {{user}};
+- voice as a behavior with a cause and conditions: register, sentence length, humor, and what changes under pressure. If an accent, slang or profanity should survive the model's habit of cleaning it up, say so outright and give the reason.
+Match intensity to the character; not every behavior needs a dramatic psychological root.
+Keep body, voice and hard constraints fixed so the character stays recognizable. Let choices vary.
+</behaviors>
+
+<specificity>
+Anything left out gets the model's most average guess. For each detail ask: if the model had to guess this, what would it guess, and would that guess flatten the character? If yes, define it and give its cause. If no, cut it.
+</specificity>
+
+<card_types>
+Identify the card type first and adapt the guide to it.
+- Single character: everything above applies.
+- Companion, romance or NSFW-focused: centering {{user}} may be the point, so the engine is optional and can be small. Prioritize consistent body facts, voice, and intimacy behaviors written with the same formula, run through the character's motivation and fears rather than labels like "dominant". Alternate greetings can open closer to the scene the Human wants.
+- Scenario: the situation is the protagonist. The scenario field carries the pressure, what keeps it from resolving, and how it escalates. Recurring NPCs each get a compact engine: goal, block, one behavior, one voice line.
+- World or narrator: {{char}} is the narrator. Define the narrator's voice and the world's rules; give factions and key NPCs goals so the world acts on its own (events, deadlines, third parties). Move bulk lore into lorebook entries instead of the description.
+- Group chat member: the card holds only that character. Shared world facts belong in a lorebook or the scenario.
+</card_types>`;
+
+// Quick prompt that starts the review-then-rewrite workflow. Quick prompts are
+// macro-expanded before sending, so {{user}} is avoided here on purpose.
+export const CARD_REVIEW_QUICK_PROMPT = {
+    id: 'qp_card_review',
+    label: 'Card Review',
+    icon: '🩺',
+    text: `Review {{char}}'s character card in two phases. This is phase 1: report only. Do not output a character-changes block yet.
+
+1. Card type: what kind of card is this (single character, companion/romance, NSFW-focused, scenario, world/narrator, group member)? If it's unclear, ask me.
+2. Description, voice and personality/behavior: is each clearly defined? If one is thin, offer 2–3 options built from what is already in the card and anything I've told you.
+3. If a card craft guide is in your instructions, compare the card with it, adapted to the card's type. For each finding, quote the line it comes from and rate it: changes how it plays / minor / matter of taste. "Works as is" is a valid verdict; say so for the parts that are fine.
+4. Any other problems you notice, such as contradictions between fields, acting or speaking for the persona, token bloat, or details that would work better as lorebook entries.
+5. List the questions you need answered, at most five, most important first.
+
+Then wait. We'll go back and forth until we agree on the character. When I say "rewrite", propose the changes: keep lines that already work word for word, and if creator_notes is an editable field, record the agreed decisions there.`,
+};
+
 export const DEFAULT_CHAT_EDIT_DIRECTIVE = `<context>
 You can edit the main roleplay chat. Messages in \`<roleplay_context>\` appear as \`<msg index="N" role="user|assistant">\`; use those index numbers.
 </context>
@@ -192,7 +265,8 @@ export const CHAR_CREATE_FORMAT_BLOCK = `\`\`\`character-create
   "personality": "Personality summary",
   "scenario": "Scenario / setting",
   "first_mes": "Opening message",
-  "mes_example": "<START>\\n*{{char}} glances up.* \\"Oh. It's you.\\""
+  "mes_example": "<START>\\n*{{char}} glances up.* \\"Oh. It's you.\\"",
+  "creator_notes": "Optional. Design notes for the Human; never sent to the roleplay model"
 }
 \`\`\``;
 
@@ -282,10 +356,21 @@ export const KNOWN_DEFAULT_PROMPT_HASHES = [
     'm8a14r9497',
     '16zfn93ijyf',
     'q508r5jjrd',
+    '20jhlz90wua',
 ];
 
     // ─── Changelog Data ──────────────────────────────────────────────────────────
 export const CHANGELOG = [
+    {
+        version: '2.10.0',
+        date: '11/23/2026',
+        announce: true,
+        notes: [
+            '<strong>Card Craft Guide</strong> — An optional, editable guide that teaches Copilot how to write and review character cards: goals and motivation, behaviors instead of labels, voice with causes, and what each field is for. Adapts to companion, NSFW, scenario and world cards. Toggle and edit it under Character Card AI Edits.',
+            '<strong>Card Review Quick Prompt</strong> — A new 🩺 quick prompt reviews the current card first (with quoted evidence and severity, and "works as is" when it does), asks clarifying questions, and rewrites only when you say so.',
+            '<strong>Creator Notes</strong> — Copilot can now read and edit the card\'s Creator Notes (never sent to the roleplay model), used to record agreed design decisions. Off by default under "Character fields sent to AI context".'
+        ],
+    },
     {
         version: '2.9.1',
         date: '9/23/2026',

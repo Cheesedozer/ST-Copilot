@@ -186,6 +186,7 @@
                             <label class="checkbox_label"><input id="scp-ce-post-history" type="checkbox" /><span>Post-History Instructions</span></label>
                             <label class="checkbox_label"><input id="scp-ce-alt-greetings" type="checkbox" /><span>Alternate Greetings <span style="font-size:10px;opacity:.6">(off by default)</span></span></label>
                             <div id="scp-ce-alt-greetings-picker" style="display:none;margin-top:4px"></div>
+                            <label class="checkbox_label" title="Never sent to the roleplay AI. Card Review uses it to record agreed design decisions."><input id="scp-ce-creator-notes" type="checkbox" /><span>Creator Notes <span style="font-size:10px;opacity:.6">(off by default — used by Card Review)</span></span></label>
                         </div>
                         <label style="margin-top:10px; font-size:11px; color:#888; display:block; margin-bottom:4px">Session History Depth Limit</label>
                         <input id="scp-history-limit" type="number" class="text_pole" placeholder="50" min="1" max="500" />
@@ -246,6 +247,20 @@
                             </label>
                             <textarea id="scp-char-edit-prompt" class="text_pole autoSetHeight" rows="5" style="font-size:12px; margin-top:4px; font-family:monospace"></textarea>
                             <button id="scp-reset-char-edit-prompt" class="menu_button interactable" style="margin-top:6px; align-self:flex-start">
+                                <i class="fa-solid fa-arrow-rotate-left"></i> Reset to Default
+                            </button>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:10px" title="Teaches Copilot how to write and review cards. Sent only while character editing is on.">
+                            <input id="scp-card-guide-enabled" type="checkbox" />
+                            <span>Use Card Craft Guide <span style="font-size:10px;opacity:.6">(~1,500 tokens)</span></span>
+                        </label>
+                        <div style="margin-top:10px">
+                            <label style="font-size:11px; color:#888; display:block; margin-bottom:4px">
+                                Card Craft Guide
+                                <span style="font-size:10px; opacity:.65"> — how cards should be written and reviewed; edit freely</span>
+                            </label>
+                            <textarea id="scp-card-guide-prompt" class="text_pole autoSetHeight" rows="6" style="font-size:12px; margin-top:4px; font-family:monospace"></textarea>
+                            <button id="scp-reset-card-guide-prompt" class="menu_button interactable" style="margin-top:6px; align-self:flex-start">
                                 <i class="fa-solid fa-arrow-rotate-left"></i> Reset to Default
                             </button>
                         </div>
